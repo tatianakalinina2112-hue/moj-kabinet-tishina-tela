@@ -900,7 +900,7 @@ const cfg = window.CABINET_SUPABASE_CONFIG;
 if (!cfg?.url || !cfg?.publishableKey) throw new Error('Не заполнены настройки Supabase.');
 const supabase = createClient(cfg.url, cfg.publishableKey, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
 const statusId = 'cloudStatus';
-let currentUser = null, timer = 0, poller = 0, applyingRemote = false, lastCloudUpdate = '';
+let currentUser = null, timer = 0, poller = 0, applyingRemote = false, syncEnabled = false, lastCloudUpdate = '';
 const setStatus = (text, error = false) => { const node = document.getElementById(statusId); if (node) { node.textContent = text; node.dataset.error = error ? '1' : '0'; } };
 const getData = () => window.__cabinetGetData?.();
 const setData = value => window.__cabinetSetData?.(value);
@@ -914,15 +914,24 @@ const gate = () => {
 };
 const status=document.createElement('div'); status.id=statusId; status.textContent='Supabase: подключение…'; document.body.append(status);
 async function hydrate(user) {
-  currentUser=user; clearInterval(poller); if(!user){gate();setStatus('Supabase: ожидается вход');return;}
+  currentUser=user; syncEnabled=false; clearInterval(poller); if(!user){gate();setStatus('Supabase: ожидается вход');return;}
   document.getElementById('cloudGate')?.remove(); setStatus('Загружаю данные кабинета…');
   const {data:row,error}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',user.id).maybeSingle();
   if(error){setStatus('Облачная загрузка не удалась: '+error.message,true);return;}
-  if(row?.snapshot){lastCloudUpdate=row.updated_at;applyingRemote=true;try{setData(row.snapshot);localStorage.setItem('moikabinet_v1',JSON.stringify(row.snapshot));}finally{applyingRemote=false;}setStatus('Синхронизировано · '+new Date(row.updated_at).toLocaleString('ru-RU'));}
-  else { const snapshot=getData(); const {error:saveError}=await supabase.from('cabinet_state').upsert({user_id:user.id,snapshot,updated_at:new Date().toISOString()},{onConflict:'user_id'}); if(saveError)setStatus('Не удалось создать облачную копию: '+saveError.message,true);else setStatus('Первая облачная копия создана.'); }
-  poller=setInterval(async()=>{if(!currentUser||timer)return;const {data:fresh,error:pollError}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',currentUser.id).maybeSingle();if(pollError){setStatus('Проверка синхронизации не удалась: '+pollError.message,true);return;}if(fresh?.snapshot&&fresh.updated_at>lastCloudUpdate){lastCloudUpdate=fresh.updated_at;applyingRemote=true;try{setData(fresh.snapshot);localStorage.setItem('moikabinet_v1',JSON.stringify(fresh.snapshot));setStatus('Получены изменения с другого устройства · '+new Date().toLocaleTimeString('ru-RU'));}finally{applyingRemote=false;}}},5000);
+  if(row?.snapshot){syncEnabled=true;lastCloudUpdate=row.updated_at;applyingRemote=true;try{setData(row.snapshot);localStorage.setItem('moikabinet_v1',JSON.stringify(row.snapshot));}finally{applyingRemote=false;}setStatus('Синхронизировано · '+new Date(row.updated_at).toLocaleString('ru-RU'));startPolling();}
+  else {setStatus('Облачной копии пока нет. Данные с этого устройства не отправлены.');initialSyncChoice(user);}
 }
-window.CABINET_SYNC={save(snapshot){if(!currentUser||applyingRemote)return;clearTimeout(timer);setStatus('Сохраняю в облако…');timer=setTimeout(async()=>{const updated_at=new Date().toISOString();const {error}=await supabase.from('cabinet_state').upsert({user_id:currentUser.id,snapshot,updated_at},{onConflict:'user_id'});if(!error)lastCloudUpdate=updated_at;setStatus(error?'Облачное сохранение не удалось: '+error.message:'Синхронизировано · '+new Date().toLocaleTimeString('ru-RU'),!!error);},650);},async signOut(){await supabase.auth.signOut();}};
+function startPolling(){clearInterval(poller);poller=setInterval(async()=>{if(!currentUser||!syncEnabled||timer)return;const {data:fresh,error:pollError}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',currentUser.id).maybeSingle();if(pollError){setStatus('Проверка синхронизации не удалась: '+pollError.message,true);return;}if(fresh?.snapshot&&fresh.updated_at>lastCloudUpdate){lastCloudUpdate=fresh.updated_at;applyingRemote=true;try{setData(fresh.snapshot);localStorage.setItem('moikabinet_v1',JSON.stringify(fresh.snapshot));setStatus('Получены изменения с другого устройства · '+new Date().toLocaleTimeString('ru-RU'));}finally{applyingRemote=false;}}},5000);}
+function initialSyncChoice(user){
+  document.getElementById('cloudSetup')?.remove();
+  const wrap=document.createElement('div');wrap.id='cloudSetup';
+  wrap.innerHTML='<div class="cloud-card"><h2>Подключить синхронизацию?</h2><p>В облаке пока нет копии. В кабинете на этом устройстве сейчас есть данные. Выбери, переносить ли их в защищённое хранилище Supabase. Ничего не отправится, пока ты не нажмёшь кнопку переноса.</p><div class="cloud-actions"><button id="cloudImport" class="btn gold" type="button">Перенести данные в облако</button><button id="cloudLocal" class="btn light" type="button">Пока оставить только на этом устройстве</button></div><p id="cloudSetupMsg" role="status"></p></div>';
+  Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'9998',display:'grid',placeItems:'center',padding:'20px',background:'#071d31eF'});
+  const style=document.createElement('style');style.textContent='#cloudSetup .cloud-card{width:min(500px,100%);padding:24px;border-radius:22px;background:#eff8fd;color:#123653;box-shadow:0 20px 60px #0006}#cloudSetup h2{margin-top:0}#cloudSetup p{line-height:1.55}#cloudSetup .cloud-actions{display:grid;gap:10px}';document.head.append(style);document.body.append(wrap);
+  wrap.querySelector('#cloudLocal').addEventListener('click',()=>{wrap.remove();setStatus('Данные остаются на этом устройстве. Синхронизация пока выключена.');});
+  wrap.querySelector('#cloudImport').addEventListener('click',async e=>{const button=e.currentTarget;button.disabled=true;wrap.querySelector('#cloudSetupMsg').textContent='Переношу данные…';const updated_at=new Date().toISOString();const {error}=await supabase.from('cabinet_state').upsert({user_id:user.id,snapshot:getData(),updated_at},{onConflict:'user_id'});button.disabled=false;if(error){wrap.querySelector('#cloudSetupMsg').textContent='Не удалось перенести данные: '+error.message;return;}syncEnabled=true;lastCloudUpdate=updated_at;wrap.remove();setStatus('Первая облачная копия создана.');startPolling();});
+}
+window.CABINET_SYNC={save(snapshot){if(!currentUser||!syncEnabled||applyingRemote)return;clearTimeout(timer);setStatus('Сохраняю в облако…');timer=setTimeout(async()=>{const updated_at=new Date().toISOString();const {error}=await supabase.from('cabinet_state').upsert({user_id:currentUser.id,snapshot,updated_at},{onConflict:'user_id'});if(!error)lastCloudUpdate=updated_at;setStatus(error?'Облачное сохранение не удалось: '+error.message:'Синхронизировано · '+new Date().toLocaleTimeString('ru-RU'),!!error);},650);},async signOut(){syncEnabled=false;await supabase.auth.signOut();}};
 supabase.auth.onAuthStateChange((_event,session)=>{if(session?.user)queueMicrotask(()=>hydrate(session.user));else hydrate(null);});
 const {data:{session}}=await supabase.auth.getSession();await hydrate(session?.user||null);
 
