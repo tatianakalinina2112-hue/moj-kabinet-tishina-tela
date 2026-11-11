@@ -898,7 +898,7 @@ import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js
 
 const cfg = window.CABINET_SUPABASE_CONFIG;
 if (!cfg?.url || !cfg?.publishableKey) throw new Error('Не заполнены настройки Supabase.');
-const supabase = createClient(cfg.url, cfg.publishableKey, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
+const supabase = createClient(cfg.url, cfg.publishableKey, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: 'implicit' } });
 const statusId = 'cloudStatus';
 let currentUser = null, timer = 0, poller = 0, applyingRemote = false, syncEnabled = false, lastCloudUpdate = '';
 const setStatus = (text, error = false) => { const node = document.getElementById(statusId); if (node) { node.textContent = text; node.dataset.error = error ? '1' : '0'; } };
@@ -910,7 +910,7 @@ const gate = () => {
   wrap.innerHTML = `<div class="cloud-card"><h2>Вход в «Мой кабинет»</h2><p>Синхронизация защищена вашим аккаунтом. Введите свою почту, чтобы получить ссылку для входа.</p><form id="cloudLogin"><label for="cloudEmail">Электронная почта</label><input id="cloudEmail" type="email" autocomplete="email" required><button class="btn gold" type="submit">Отправить ссылку для входа</button></form><p id="cloudMsg" role="status"></p><small>Войти сможете только вы. Не пересылайте ссылку для входа.</small></div>`;
   Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'9999',display:'grid',placeItems:'center',padding:'20px',background:'#071d31eF'});
   const style=document.createElement('style');style.textContent='#cloudGate .cloud-card{width:min(460px,100%);padding:24px;border-radius:22px;background:#eff8fd;color:#123653;box-shadow:0 20px 60px #0006}#cloudGate h2{margin-top:0}#cloudGate p,#cloudGate small{line-height:1.55}#cloudGate form{display:grid;gap:12px}#cloudGate input{padding:12px;border:1px solid #9bbbd0;border-radius:10px;font:inherit}#cloudStatus{position:fixed;right:12px;top:12px;z-index:50;padding:7px 12px;border-radius:99px;background:#e8f4fb;color:#123653;font-size:12px;box-shadow:0 2px 10px #1234}#cloudStatus[data-error="1"]{background:#fee;color:#822}';document.head.append(style);document.body.append(wrap);
-  wrap.querySelector('#cloudLogin').addEventListener('submit', async e => { e.preventDefault(); const email=wrap.querySelector('#cloudEmail').value.trim(); const msg=wrap.querySelector('#cloudMsg'); msg.textContent='Отправляю письмо…'; const {error}=await supabase.auth.signInWithOtp({email,options:{emailRedirectTo:location.href}}); msg.textContent=error?error.message:'Письмо со ссылкой отправлено. Открой его на этом устройстве и вернись сюда.'; });
+  wrap.querySelector('#cloudLogin').addEventListener('submit', async e => { e.preventDefault(); const email=wrap.querySelector('#cloudEmail').value.trim(); const msg=wrap.querySelector('#cloudMsg'); msg.textContent='Отправляю письмо…'; const {error}=await supabase.auth.signInWithOtp({email,options:{emailRedirectTo:location.href}}); msg.textContent=error?`Не удалось отправить письмо: ${error.message}`:'Письмо отправлено. Открой его на этом устройстве: после подтверждения появится экран подключения синхронизации.'; });
 };
 const status=document.createElement('div'); status.id=statusId; status.textContent='Supabase: подключение…'; document.body.append(status);
 async function hydrate(user) {
@@ -933,7 +933,13 @@ function initialSyncChoice(user){
 }
 window.CABINET_SYNC={save(snapshot){if(!currentUser||!syncEnabled||applyingRemote)return;clearTimeout(timer);setStatus('Сохраняю в облако…');timer=setTimeout(async()=>{const updated_at=new Date().toISOString();const {error}=await supabase.from('cabinet_state').upsert({user_id:currentUser.id,snapshot,updated_at},{onConflict:'user_id'});if(!error)lastCloudUpdate=updated_at;setStatus(error?'Облачное сохранение не удалось: '+error.message:'Синхронизировано · '+new Date().toLocaleTimeString('ru-RU'),!!error);},650);},async signOut(){syncEnabled=false;await supabase.auth.signOut();}};
 supabase.auth.onAuthStateChange((_event,session)=>{if(session?.user)queueMicrotask(()=>hydrate(session.user));else hydrate(null);});
-const {data:{session}}=await supabase.auth.getSession();await hydrate(session?.user||null);
+// Parse the callback immediately; auth events below update the page once Supabase
+// has exchanged the one-time link for a session.
+const callbackError = new URLSearchParams(location.hash.slice(1)).get('error_description');
+if(callbackError) setStatus('Вход по ссылке не завершён: '+decodeURIComponent(callbackError.replace(/\+/g,' ')),true);
+const {data:{session},error:sessionError}=await supabase.auth.getSession();
+if(sessionError) setStatus('Не удалось подтвердить вход: '+sessionError.message,true);
+await hydrate(session?.user||null);
 
 </script>
 </body></html>
