@@ -886,5 +886,5 @@ window.__cabinetGetData=()=>data;window.__cabinetSetData=value=>{data={...data,.
 initAppTheme();if(startupStorageError)alert(startupStorageError);$('profileForm')?.addEventListener('submit',saveProfile);renderProfile();
 $('greetingSettingsForm')?.addEventListener('submit',saveGreetingSettings);renderGreetingSettings();renderGreeting();$('integrationLinksForm')?.addEventListener('submit',saveIntegrationLinks);renderIntegrationLinks();$('today').textContent=new Date().toLocaleDateString('ru-RU',{day:'numeric',month:'long'});renderDailyThought();$('filterDate').value=today();calendarCursor=new Date();calendarCursor.setDate(1);if($('financeMonth'))$('financeMonth').value=today().slice(0,7);renderAll();setInterval(renderGreeting,60000);checkAppointmentReminders();setInterval(checkAppointmentReminders,30000);checkDiaryTaskReminders();setInterval(checkDiaryTaskReminders,30000);
 </script>
-<script type="module" src="supabase/cloud-sync.js"></script>
+<script type="module" src="supabase/cloud-sync.js?v=da82c97"></script>
 </body></html>
