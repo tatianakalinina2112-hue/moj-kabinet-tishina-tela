@@ -31,10 +31,41 @@ const setData = value => window.__cabinetSetData?.(value);
 const gate = () => {
   if (document.getElementById('cloudGate')) return;
   const wrap = document.createElement('div'); wrap.id = 'cloudGate';
-  wrap.innerHTML = `<div class="cloud-card"><h2>Вход в «Мой кабинет»</h2><p>Синхронизация защищена вашим аккаунтом. Введите свою почту, чтобы получить ссылку для входа.</p><form id="cloudLogin"><label for="cloudEmail">Электронная почта</label><input id="cloudEmail" type="email" autocomplete="email" required><button class="btn gold" type="submit">Отправить ссылку для входа</button></form><p id="cloudMsg" role="status"></p><small>Войти сможете только вы. Не пересылайте ссылку для входа.</small></div>`;
-  Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'9999',display:'grid',placeItems:'center',padding:'20px',background:'#071d31eF'});
+  wrap.innerHTML = `<div class="cloud-card"><h2>Вход в «Мой кабинет»</h2><p>Войди один раз на этом устройстве. Кабинет сохранит вход в этом браузере.</p><form id="cloudLogin"><label for="cloudEmail">Электронная почта</label><input id="cloudEmail" type="email" autocomplete="username" required><label for="cloudPassword">Пароль</label><input id="cloudPassword" type="password" autocomplete="current-password" required><button class="btn gold" type="submit">Войти</button></form><button id="cloudReset" class="btn light" type="button">Установить или восстановить пароль</button><p id="cloudMsg" role="status" aria-live="polite"></p><small>Пароль нужен только для первого входа или после выхода из аккаунта.</small></div>`;
+  Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'9999',display:'grid',placeItems:'center',padding:'20px',background:'#071d31eF',overflowY:'auto'});
   const style=document.createElement('style');style.textContent='#cloudGate .cloud-card{width:min(460px,100%);padding:24px;border-radius:22px;background:#eff8fd;color:#123653;box-shadow:0 20px 60px #0006}#cloudGate h2{margin-top:0}#cloudGate p,#cloudGate small{line-height:1.55}#cloudGate form{display:grid;gap:12px}#cloudGate input{padding:12px;border:1px solid #9bbbd0;border-radius:10px;font:inherit}#cloudStatus{position:fixed;right:12px;top:12px;z-index:50;padding:7px 12px;border-radius:99px;background:#e8f4fb;color:#123653;font-size:12px;box-shadow:0 2px 10px #1234}#cloudStatus[data-error="1"]{background:#fee;color:#822}';document.head.append(style);document.body.append(wrap);
-  wrap.querySelector('#cloudLogin').addEventListener('submit', async e => { e.preventDefault(); const email=wrap.querySelector('#cloudEmail').value.trim(); const msg=wrap.querySelector('#cloudMsg'); msg.textContent='Отправляю письмо…'; try{const {error}=await supabase.auth.signInWithOtp({email,options:{emailRedirectTo:location.href}});msg.textContent=error?`Не удалось отправить письмо: ${error.message}`:'Письмо отправлено. Открой его на этом устройстве: после подтверждения появится экран подключения синхронизации.';}catch(error){msg.textContent=`Не удалось отправить письмо: ${error?.message||'проверь интернет и попробуй ещё раз.'}`;} });
+  const form = wrap.querySelector('#cloudLogin');
+  const reset = wrap.querySelector('#cloudReset');
+  const msg = wrap.querySelector('#cloudMsg');
+  let busy = false;
+  form.addEventListener('submit', async e => {
+    e.preventDefault(); if(busy)return; busy=true;
+    const button=form.querySelector('button'); button.disabled=true; reset.disabled=true;
+    msg.textContent='Проверяю вход…';
+    try {
+      const {data,error}=await supabase.auth.signInWithPassword({email:wrap.querySelector('#cloudEmail').value.trim().toLowerCase(),password:wrap.querySelector('#cloudPassword').value});
+      if(error)throw error;
+      wrap.querySelector('#cloudPassword').value='';
+      if(!data?.session)throw new Error('Сервер не подтвердил вход.');
+      await hydrate(data.session.user);
+    } catch(error) { msg.textContent=authMessage(error); }
+    finally {busy=false;button.disabled=false;reset.disabled=false;}
+  });
+  reset.addEventListener('click', async()=>{
+    if(busy)return;
+    const emailField=wrap.querySelector('#cloudEmail');
+    if(!emailField.reportValidity())return;
+    busy=true;reset.disabled=true;form.querySelector('button').disabled=true;
+    msg.textContent='Запрашиваю письмо для установки пароля…';
+    try {
+      // The recovery request and callback must share this browser's PKCE storage.
+      sessionStorage.setItem('cabinet_password_setup','pending');
+      const {error}=await supabase.auth.resetPasswordForEmail(emailField.value.trim().toLowerCase(),{redirectTo:location.origin+location.pathname});
+      if(error)throw error;
+      msg.textContent='Если эта почта зарегистрирована, на неё отправлена ссылка для установки пароля. Открой новое письмо в этом же браузере. Это нужно один раз.';
+    } catch(error){sessionStorage.removeItem('cabinet_password_setup');msg.textContent=authMessage(error);}
+    finally{busy=false;form.querySelector('button').disabled=false;setTimeout(()=>{reset.disabled=false;},60000);}
+  });
 };
 async function hydrate(user) {
   currentUser=user; syncEnabled=false; clearInterval(poller); if(!user){gate();setStatus('Supabase: ожидается вход');return;}
@@ -55,8 +86,37 @@ function initialSyncChoice(user){
   wrap.querySelector('#cloudImport').addEventListener('click',async e=>{const button=e.currentTarget;button.disabled=true;wrap.querySelector('#cloudSetupMsg').textContent='Переношу данные…';const updated_at=new Date().toISOString();const {error}=await supabase.from('cabinet_state').upsert({user_id:user.id,snapshot:getData(),updated_at},{onConflict:'user_id'});button.disabled=false;if(error){wrap.querySelector('#cloudSetupMsg').textContent='Не удалось перенести данные: '+error.message;return;}syncEnabled=true;lastCloudUpdate=updated_at;wrap.remove();setStatus('Первая облачная копия создана.');startPolling();});
 }
 window.CABINET_SYNC={save(snapshot){if(!currentUser||!syncEnabled||applyingRemote)return;clearTimeout(timer);setStatus('Сохраняю в облако…');timer=setTimeout(async()=>{const updated_at=new Date().toISOString();const {error}=await supabase.from('cabinet_state').upsert({user_id:currentUser.id,snapshot,updated_at},{onConflict:'user_id'});if(!error)lastCloudUpdate=updated_at;setStatus(error?'Облачное сохранение не удалось: '+error.message:'Синхронизировано · '+new Date().toLocaleTimeString('ru-RU'),!!error);},650);},async signOut(){syncEnabled=false;await supabase.auth.signOut();}};
+
+function authMessage(error){
+  const message=error?.message||'';
+  if(/Failed to fetch|fetch failed|NetworkError|network request/i.test(message))return 'Нет соединения с сервером входа. Пароль не проверен. Проверь интернет и попробуй позже.';
+  if(/rate limit/i.test(message))return 'Слишком много запросов. Нужно дождаться восстановления лимита; повторные нажатия не помогут.';
+  if(/Invalid login credentials/i.test(message))return 'Не подошла почта или пароль. Если пароль ещё не задан, нажми «Установить или восстановить пароль».';
+  return 'Не удалось завершить действие: '+message;
+}
+function showPasswordSetup(){
+  if(document.getElementById('passwordSetup'))return;
+  document.getElementById('cloudGate')?.remove();
+  const wrap=document.createElement('div');wrap.id='passwordSetup';
+  Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'10001',display:'grid',placeItems:'center',padding:'20px',background:'#071d31ef',overflowY:'auto'});
+  wrap.innerHTML=`<div style="width:min(460px,100%);box-sizing:border-box;padding:24px;border-radius:22px;background:#eff8fd;color:#123653"><h2>Установить пароль кабинета</h2><p>Почта подтверждена. Задай пароль, чтобы дальше входить без писем.</p><form id="passwordSetupForm" style="display:grid;gap:12px"><label for="newCabinetPassword">Новый пароль — от 12 символов</label><input id="newCabinetPassword" type="password" autocomplete="new-password" minlength="12" required><label for="confirmCabinetPassword">Повтори пароль</label><input id="confirmCabinetPassword" type="password" autocomplete="new-password" minlength="12" required><button class="btn gold" type="submit">Сохранить пароль и открыть кабинет</button></form><p id="passwordSetupMsg" role="status"></p></div>`;
+  document.body.append(wrap);
+  wrap.querySelector('form').addEventListener('submit',async e=>{
+    e.preventDefault();const button=wrap.querySelector('button');if(button.disabled)return;
+    const first=wrap.querySelector('#newCabinetPassword'),second=wrap.querySelector('#confirmCabinetPassword'),msg=wrap.querySelector('#passwordSetupMsg');
+    if(first.value!==second.value){msg.textContent='Пароли не совпадают.';return;}
+    if(first.value.length<12){msg.textContent='Введи не менее 12 символов.';return;}
+    button.disabled=true;msg.textContent='Сохраняю пароль…';
+    try{
+      const {data,error}=await supabase.auth.updateUser({password:first.value});if(error)throw error;
+      first.value='';second.value='';sessionStorage.removeItem('cabinet_password_setup');wrap.remove();
+      await hydrate(data.user);
+    }catch(error){msg.textContent=authMessage(error);button.disabled=false;}
+  });
+}
+
 let authReady = false;
-supabase.auth.onAuthStateChange((_event,session)=>{if(authReady) setTimeout(()=>hydrate(session?.user||null),0);});
+supabase.auth.onAuthStateChange((event,session)=>{if(event==='PASSWORD_RECOVERY')sessionStorage.setItem('cabinet_password_setup','pending');if(authReady)setTimeout(()=>{if(session?.user&&sessionStorage.getItem('cabinet_password_setup')==='pending')showPasswordSetup();else hydrate(session?.user||null);},0);});
 // Parse the callback immediately; auth events below update the page once Supabase
 // has exchanged the one-time link for a session.
 const callbackParams = new URLSearchParams(location.hash.slice(1));
@@ -80,7 +140,8 @@ try {
   }
 } catch (error) { sessionError = error; }
 authReady = true;
-await hydrate(session?.user||null);
+if(session?.user&&sessionStorage.getItem('cabinet_password_setup')==='pending')showPasswordSetup();
+else await hydrate(session?.user||null);
 if (!session?.user && (callbackError || sessionError)) {
   const detail = callbackError || sessionError.message || 'Не удалось связаться с сервером входа.';
   const message = /verifier|flow_state/i.test(detail)
