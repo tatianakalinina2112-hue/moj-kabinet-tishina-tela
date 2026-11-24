@@ -24,7 +24,22 @@ async function loadCreateClient(){
   showSdkLoadError(lastError);throw lastError;
 }
 const createClient=await loadCreateClient();
-const supabase = createClient(cfg.url, cfg.publishableKey, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false, flowType: 'pkce' } });
+async function authFetch(input, options = {}) {
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort();
+  if (options.signal?.aborted) controller.abort();
+  options.signal?.addEventListener('abort', forwardAbort, {once:true});
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try { return await fetch(input, {...options, signal:controller.signal}); }
+  catch (error) {
+    if (controller.signal.aborted) throw new Error('Нет ответа сервера за 15 секунд. Статус отправки письма неизвестен. Проверь почту; не отправляй запрос повторно сразу.');
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    options.signal?.removeEventListener('abort', forwardAbort);
+  }
+}
+const supabase = createClient(cfg.url, cfg.publishableKey, { global: {fetch: authFetch}, auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false, flowType: 'pkce' } });
 let currentUser = null, timer = 0, poller = 0, applyingRemote = false, syncEnabled = false, lastCloudUpdate = '';
 const getData = () => window.__cabinetGetData?.();
 const setData = value => window.__cabinetSetData?.(value);
