@@ -43,6 +43,14 @@ const supabase = createClient(cfg.url, cfg.publishableKey, { global: {fetch: aut
 let currentUser = null, timer = 0, poller = 0, applyingRemote = false, syncEnabled = false, lastCloudUpdate = '';
 const getData = () => window.__cabinetGetData?.();
 const setData = value => window.__cabinetSetData?.(value);
+// Recovery links open in a new tab. sessionStorage is isolated per tab, so
+// remember only this UI intent (never credentials) across tabs of this origin.
+function markPasswordSetup(){localStorage.setItem('cabinet_password_setup',String(Date.now()));}
+function wantsPasswordSetup(){
+  const stamp=Number(localStorage.getItem('cabinet_password_setup'));
+  return Number.isFinite(stamp)&&stamp>0&&Date.now()-stamp>=0&&Date.now()-stamp<3600000;
+}
+function clearPasswordSetup(){localStorage.removeItem('cabinet_password_setup');sessionStorage.removeItem('cabinet_password_setup');}
 const gate = () => {
   if (document.getElementById('cloudGate')) return;
   const wrap = document.createElement('div'); wrap.id = 'cloudGate';
@@ -74,11 +82,11 @@ const gate = () => {
     msg.textContent='Запрашиваю письмо для установки пароля…';
     try {
       // The recovery request and callback must share this browser's PKCE storage.
-      sessionStorage.setItem('cabinet_password_setup','pending');
+      markPasswordSetup();
       const {error}=await supabase.auth.resetPasswordForEmail(emailField.value.trim().toLowerCase(),{redirectTo:location.origin+location.pathname});
       if(error)throw error;
       msg.textContent='Если эта почта зарегистрирована, на неё отправлена ссылка для установки пароля. Открой новое письмо в этом же браузере. Это нужно один раз.';
-    } catch(error){sessionStorage.removeItem('cabinet_password_setup');msg.textContent=authMessage(error);}
+    } catch(error){clearPasswordSetup();msg.textContent=authMessage(error);}
     finally{busy=false;form.querySelector('button').disabled=false;setTimeout(()=>{reset.disabled=false;},60000);}
   });
 };
@@ -124,14 +132,14 @@ function showPasswordSetup(){
     button.disabled=true;msg.textContent='Сохраняю пароль…';
     try{
       const {data,error}=await supabase.auth.updateUser({password:first.value});if(error)throw error;
-      first.value='';second.value='';sessionStorage.removeItem('cabinet_password_setup');wrap.remove();
+      first.value='';second.value='';clearPasswordSetup();wrap.remove();
       await hydrate(data.user);
     }catch(error){msg.textContent=authMessage(error);button.disabled=false;}
   });
 }
 
 let authReady = false;
-supabase.auth.onAuthStateChange((event,session)=>{if(event==='PASSWORD_RECOVERY')sessionStorage.setItem('cabinet_password_setup','pending');if(authReady)setTimeout(()=>{if(session?.user&&sessionStorage.getItem('cabinet_password_setup')==='pending')showPasswordSetup();else hydrate(session?.user||null);},0);});
+supabase.auth.onAuthStateChange((event,session)=>{if(event==='PASSWORD_RECOVERY')markPasswordSetup();if(authReady)setTimeout(()=>{if(session?.user&&wantsPasswordSetup())showPasswordSetup();else hydrate(session?.user||null);},0);});
 // Parse the callback immediately; auth events below update the page once Supabase
 // has exchanged the one-time link for a session.
 const callbackParams = new URLSearchParams(location.hash.slice(1));
@@ -155,7 +163,7 @@ try {
   }
 } catch (error) { sessionError = error; }
 authReady = true;
-if(session?.user&&sessionStorage.getItem('cabinet_password_setup')==='pending')showPasswordSetup();
+if(session?.user&&wantsPasswordSetup())showPasswordSetup();
 else await hydrate(session?.user||null);
 if (!session?.user && (callbackError || sessionError)) {
   const detail = callbackError || sessionError.message || 'Не удалось связаться с сервером входа.';
