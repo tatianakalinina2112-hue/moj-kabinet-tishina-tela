@@ -24,7 +24,7 @@ async function loadCreateClient(){
   showSdkLoadError(lastError);throw lastError;
 }
 const createClient=await loadCreateClient();
-const supabase = createClient(cfg.url, cfg.publishableKey, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: 'pkce' } });
+const supabase = createClient(cfg.url, cfg.publishableKey, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false, flowType: 'pkce' } });
 let currentUser = null, timer = 0, poller = 0, applyingRemote = false, syncEnabled = false, lastCloudUpdate = '';
 const getData = () => window.__cabinetGetData?.();
 const setData = value => window.__cabinetSetData?.(value);
@@ -55,13 +55,38 @@ function initialSyncChoice(user){
   wrap.querySelector('#cloudImport').addEventListener('click',async e=>{const button=e.currentTarget;button.disabled=true;wrap.querySelector('#cloudSetupMsg').textContent='Переношу данные…';const updated_at=new Date().toISOString();const {error}=await supabase.from('cabinet_state').upsert({user_id:user.id,snapshot:getData(),updated_at},{onConflict:'user_id'});button.disabled=false;if(error){wrap.querySelector('#cloudSetupMsg').textContent='Не удалось перенести данные: '+error.message;return;}syncEnabled=true;lastCloudUpdate=updated_at;wrap.remove();setStatus('Первая облачная копия создана.');startPolling();});
 }
 window.CABINET_SYNC={save(snapshot){if(!currentUser||!syncEnabled||applyingRemote)return;clearTimeout(timer);setStatus('Сохраняю в облако…');timer=setTimeout(async()=>{const updated_at=new Date().toISOString();const {error}=await supabase.from('cabinet_state').upsert({user_id:currentUser.id,snapshot,updated_at},{onConflict:'user_id'});if(!error)lastCloudUpdate=updated_at;setStatus(error?'Облачное сохранение не удалось: '+error.message:'Синхронизировано · '+new Date().toLocaleTimeString('ru-RU'),!!error);},650);},async signOut(){syncEnabled=false;await supabase.auth.signOut();}};
-supabase.auth.onAuthStateChange((_event,session)=>{if(session?.user)queueMicrotask(()=>hydrate(session.user));else hydrate(null);});
+let authReady = false;
+supabase.auth.onAuthStateChange((_event,session)=>{if(authReady) setTimeout(()=>hydrate(session?.user||null),0);});
 // Parse the callback immediately; auth events below update the page once Supabase
 // has exchanged the one-time link for a session.
 const callbackParams = new URLSearchParams(location.hash.slice(1));
 const queryParams = new URLSearchParams(location.search);
 const callbackError = callbackParams.get('error_description') || callbackParams.get('error') || queryParams.get('error_description') || queryParams.get('error');
-const {data:{session},error:sessionError}=await supabase.auth.getSession();
+let session = null, sessionError = null;
+try {
+  const code = queryParams.get('code');
+  if (code) {
+    setStatus('Подтверждаю вход по ссылке…');
+    const result = await supabase.auth.exchangeCodeForSession(code);
+    session = result.data?.session; sessionError = result.error;
+    if (session) {
+      const cleanUrl = new URL(location.href);
+      cleanUrl.searchParams.delete('code');
+      history.replaceState(history.state, '', cleanUrl.pathname + cleanUrl.search);
+    }
+  } else {
+    const result = await supabase.auth.getSession();
+    session = result.data?.session; sessionError = result.error;
+  }
+} catch (error) { sessionError = error; }
+authReady = true;
 await hydrate(session?.user||null);
-if(!session?.user && callbackError) setStatus('Вход по ссылке не завершён: '+callbackError,true);
-else if(!session?.user && sessionError) setStatus('Не удалось подтвердить вход: '+sessionError.message,true);
+if (!session?.user && (callbackError || sessionError)) {
+  const detail = callbackError || sessionError.message || 'Не удалось связаться с сервером входа.';
+  const message = /verifier|flow_state/i.test(detail)
+    ? 'Не найдено подтверждение запроса в этом браузере. Запроси новую ссылку здесь и открой её в этом же браузере. Не запрашивай несколько ссылок подряд.'
+    : 'Вход по ссылке не завершён: ' + detail;
+  setStatus(message, true);
+  const messageNode = document.getElementById('cloudMsg');
+  if (messageNode) messageNode.textContent = message;
+}
