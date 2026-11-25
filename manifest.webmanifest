@@ -1,0 +1,15 @@
+{
+  "id": "/",
+  "name": "Мой кабинет — ТК",
+  "short_name": "Мой кабинет",
+  "lang": "ru",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#eff8fd",
+  "theme_color": "#082e52",
+  "icons": [
+    {"src": "/app-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/app-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}
