@@ -144,14 +144,26 @@ supabase.auth.onAuthStateChange((event,session)=>{if(event==='PASSWORD_RECOVERY'
 // has exchanged the one-time link for a session.
 const callbackParams = new URLSearchParams(location.hash.slice(1));
 const queryParams = new URLSearchParams(location.search);
+const authTrace = {time:new Date().toISOString(),codePresent:queryParams.has('code'),serverError:queryParams.get('error_code')||callbackParams.get('error_code')||null,stage:'callback-read'};
+try {
+  const ref = new URL(cfg.url).hostname.split('.')[0];
+  authTrace.browserProofPresent = !!localStorage.getItem('sb-'+ref+'-auth-token-code-verifier');
+} catch { authTrace.browserProofPresent = null; }
+function saveAuthTrace(stage){
+  authTrace.stage=stage;
+  try{localStorage.setItem('cabinet_auth_diagnostic',JSON.stringify(authTrace));}catch{}
+}
+saveAuthTrace('callback-read');
 const callbackError = callbackParams.get('error_description') || callbackParams.get('error') || queryParams.get('error_description') || queryParams.get('error');
 let session = null, sessionError = null;
 try {
   const code = queryParams.get('code');
   if (code) {
+    saveAuthTrace('code-exchange-started');
     setStatus('Подтверждаю вход по ссылке…');
     const result = await supabase.auth.exchangeCodeForSession(code);
     session = result.data?.session; sessionError = result.error;
+    saveAuthTrace(session?'code-exchange-succeeded':'code-exchange-failed');
     if (session) {
       const cleanUrl = new URL(location.href);
       cleanUrl.searchParams.delete('code');
@@ -161,7 +173,7 @@ try {
     const result = await supabase.auth.getSession();
     session = result.data?.session; sessionError = result.error;
   }
-} catch (error) { sessionError = error; }
+} catch (error) { sessionError = error; saveAuthTrace('callback-exception'); }
 authReady = true;
 if(session?.user&&wantsPasswordSetup())showPasswordSetup();
 else await hydrate(session?.user||null);
@@ -173,4 +185,13 @@ if (!session?.user && (callbackError || sessionError)) {
   setStatus(message, true);
   const messageNode = document.getElementById('cloudMsg');
   if (messageNode) messageNode.textContent = message;
+}
+if(!session?.user){
+  const messageNode=document.getElementById('cloudMsg');
+  if(messageNode){
+    const diagnostic=document.createElement('small');
+    diagnostic.style.display='block';
+    diagnostic.textContent='Проверка входа: '+(authTrace.serverError?'сервер отклонил ссылку ('+authTrace.serverError+')':authTrace.codePresent?'код получен; '+(authTrace.browserProofPresent?'подтверждение браузера есть':'подтверждение браузера отсутствует'):'код подтверждения в адресе отсутствует')+'. Этап: '+authTrace.stage+'. Версия: auth-check-1.';
+    messageNode.after(diagnostic);
+  }
 }
