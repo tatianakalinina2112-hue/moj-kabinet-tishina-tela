@@ -29,5 +29,12 @@ function browser(server,storage=new Map()){
  const legacy=browser(new Map(),new Map([['moikabinet_legacy:'+legacyOwner,JSON.stringify(example('legacy-owner'))]]));await legacy.hydrate(B);assert.equal(legacy.ctx.visible.clients.length,0);await legacy.hydrate(legacyOwner);assert.equal(legacy.ctx.visible.clients[0].name,'legacy-owner');assert(legacy.ctx.document.getElementById('cloudSetup'));assert.equal(legacy.writes.length,0,'legacy not uploaded automatically');
  // A poll that finishes after switching users must also be ignored.
  const p=browser(server);await p.hydrate(A);p.override(()=>new Promise(resolve=>release=resolve));const polling=[...p.polls.values()][0]();p.override(null);await p.hydrate(B);release({data:{snapshot:example('late-poll-A'),updated_at:'2099'},error:null});await polling;assert.equal(p.ctx.visible.clients[0].name,'B-private');
- console.log('PASS: A/B isolation, logout clearing, cancelled delayed save, pending own recovery, second browser own snapshot, stale hydration/poll ignored, failed load locked, legacy restricted to known owner. Backend is mocked; live RLS not asserted.');
+ // An older queued write must not replace a newer unsent edit in recovery storage.
+ const q=browser(server);await q.hydrate(A);let finishWrite;
+ q.ctx.supabase.from=()=>({async upsert(){return new Promise(resolve=>finishWrite=()=>resolve({error:null}))}});
+ const older=example('older'),newer=example('newer');
+ q.api.markPending(JSON.stringify(older));q.api.save(older);const sending=q.flush();await Promise.resolve();await Promise.resolve();
+ q.api.markPending(JSON.stringify(newer));finishWrite();await sending;
+ assert.equal(JSON.parse(q.storage.get('moikabinet_pending:'+A)).clients[0].name,'newer');
+ console.log('PASS: A/B isolation, logout clearing, cancelled delayed save, pending own recovery, second browser own snapshot, stale hydration/poll ignored, failed load locked, legacy restricted to known owner, newer pending edit preserved. Backend is mocked; live RLS not asserted.');
 })().catch(e=>{console.error(e);process.exitCode=1});

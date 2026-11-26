@@ -156,7 +156,8 @@ function saveSnapshot(id,epoch,serialized){
 }
 async function writeSnapshot(id,epoch,serialized){
   if(!isCurrent(id,epoch)||!accountReady||!syncEnabled)return;
-  localStorage.setItem(pendingKey(id),serialized);
+  // A newer edit may already be pending while this older write was queued.
+  if(!localStorage.getItem(pendingKey(id)))localStorage.setItem(pendingKey(id),serialized);
   const updated_at=new Date().toISOString();
   try{
     const {error}=await supabase.from('cabinet_state').upsert({user_id:id,snapshot:JSON.parse(serialized),updated_at},{onConflict:'user_id'});
