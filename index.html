@@ -892,7 +892,69 @@ function currentAppTheme(){try{const saved=localStorage.getItem(APP_THEME_KEY);i
 function backup(){try{if(greetingSettingsLoadError)throw new Error("Настройки приветствия не удалось прочитать; сначала проверь их в разделе «Ещё».");const envelope={_format:"moikabinet-backup",_version:2,exportedAt:new Date().toISOString(),data:JSON.parse(JSON.stringify(data)),settings:{greeting:normalizeGreetingBackup(greetingSettings),theme:currentAppTheme()}};const json=JSON.stringify(envelope,null,2),blob=new Blob([json],{type:"application/json"}),url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download="Мой_кабинет_резервная_копия.json";document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000)}catch(e){alert("Не удалось подготовить полную резервную копию: "+(e.message||"ошибка чтения данных")+". Данные кабинета не изменены.")}}
 function validateBackup(value){if(!value||typeof value!=="object"||Array.isArray(value))throw new Error("Файл должен содержать объект данных");let payload=value,settings=null,version=1;if(value._format==="moikabinet-backup"){if(value._version!==2)throw new Error("Версия резервной копии не поддерживается");if(!value.data||typeof value.data!=="object"||Array.isArray(value.data))throw new Error("В копии отсутствуют данные кабинета");if(!value.settings||typeof value.settings!=="object"||Array.isArray(value.settings))throw new Error("В копии отсутствуют настройки профиля");if(!Object.prototype.hasOwnProperty.call(APP_THEMES,value.settings.theme))throw new Error("В копии указана неизвестная тема оформления");settings={greeting:normalizeGreetingBackup(value.settings.greeting),theme:value.settings.theme};payload=value.data;version=2}for(const key of ["appointments","clients","services"])if(!Array.isArray(payload[key]))throw new Error("В файле отсутствует корректный раздел «"+key+"»");const optional=["finance","inventory","inventoryMovements","protocols","diary","visitJournal","fileCategories","documents","documentTemplates","recommendations"];for(const key of optional)if(payload[key]!==undefined&&!Array.isArray(payload[key]))throw new Error("Некорректный раздел «"+key+"»");for(const key of ["appointments","clients","services","finance","inventory","inventoryMovements","protocols","diary","visitJournal","documents","documentTemplates","recommendations"])if((payload[key]||[]).some(x=>!x||typeof x!=="object"||Array.isArray(x)))throw new Error("В разделе «"+key+"» есть некорректные записи");if((payload.fileCategories||[]).some(x=>typeof x!=="string"||!x.trim()))throw new Error("Некорректный список категорий файлов");for(const doc of payload.documents||[])if(doc.contentDataUrl!==undefined&&typeof doc.contentDataUrl!=="string")throw new Error("Некорректное вложение в разделе «documents»");const normalized={...payload,profile:normalizeProfile(payload.profile),finance:payload.finance||[],inventory:payload.inventory||[],inventoryMovements:payload.inventoryMovements||[],protocols:payload.protocols||[],followupSettings:{inactiveDays:60,cancelledDays:1,courseDays:30,...payload.followupSettings},diary:payload.diary||[],visitJournal:payload.visitJournal||[],fileCategories:payload.fileCategories||["Без категории","Процедуры","Анкеты","Согласия","Рекомендации"],documents:payload.documents||[],documentTemplates:payload.documentTemplates||[],recommendations:payload.recommendations||[]};return {version,data:normalized,settings}}
 function setStorageValue(key,value){try{if(value===null)localStorage.removeItem(key);else localStorage.setItem(key,value);return true}catch(e){return false}}
-function restore(e){const input=e.target,file=input.files&&input.files[0];if(!file)return;const reader=new FileReader();reader.onerror=()=>{alert("Не удалось прочитать резервную копию. Текущие данные сохранены.");input.value=""};reader.onload=()=>{const previousData=lastSavedData,previousGreeting={...greetingSettings},previousGreetingError=greetingSettingsLoadError,previousTheme=currentAppTheme();let previousRaw=null,previousGreetingRaw=null,previousThemeRaw=null,snapshotsReady=false;try{previousRaw=localStorage.getItem(KEY);previousGreetingRaw=localStorage.getItem(GREETING_KEY);previousThemeRaw=localStorage.getItem(APP_THEME_KEY);snapshotsReady=true;const parsed=JSON.parse(reader.result),checked=validateBackup(parsed),candidate=checked.data,legacyData=checked.version===1?parsed:parsed.data;if(checked.version===1){if(!legacyData.profile)candidate.profile={...data.profile};else if(!legacyData.profile.theme)candidate.profile.theme=data.profile.theme;for(const key of ["finance","inventory","diary","visitJournal","fileCategories","documents","documentTemplates","recommendations","inventoryMovements","protocols"])if(!Array.isArray(legacyData[key]))candidate[key]=data[key]||candidate[key];if(!legacyData.followupSettings)candidate.followupSettings=data.followupSettings||candidate.followupSettings}const nextGreeting=checked.settings?.greeting||previousGreeting,nextTheme=checked.settings?.theme||previousTheme;candidate.profile=normalizeProfile({...candidate.profile,theme:nextTheme});const serialized=JSON.stringify(candidate);localStorage.setItem(KEY,serialized);if(checked.version===2){localStorage.setItem(GREETING_KEY,JSON.stringify(nextGreeting));localStorage.setItem(APP_THEME_KEY,nextTheme)}data=candidate;lastSavedData=serialized;greetingSettings=nextGreeting;greetingSettingsLoadError="";startupStorageError="";setAppTheme(nextTheme,false);renderGreeting();renderGreetingSettings();renderAll();alert(checked.version===2?"Данные и настройки восстановлены. Проверка файла и сохранение прошли успешно.":"Данные восстановлены из старой копии. Приветствие и тема оставлены текущими.")}catch(err){let rollbackOk=true;if(snapshotsReady){for(const [key,value] of [[KEY,previousRaw],[GREETING_KEY,previousGreetingRaw],[APP_THEME_KEY,previousThemeRaw]])if(!setStorageValue(key,value))rollbackOk=false}try{data=JSON.parse(previousData);lastSavedData=previousData;greetingSettings=previousGreeting;greetingSettingsLoadError=previousGreetingError;setAppTheme(previousTheme,false);if(snapshotsReady)setStorageValue(APP_THEME_KEY,previousThemeRaw);renderGreeting();renderGreetingSettings();renderAll()}catch(uiError){}alert("Резервная копия не восстановлена: "+(err.message||"не удалось проверить файл")+". "+(rollbackOk?"Предыдущие данные и настройки сохранены.":"Откат хранилища не удалось подтвердить; не закрывай вкладку и скачай резервную копию."))}finally{input.value=""}};reader.readAsText(file)}const APP_THEME_KEY='moikabinet_theme_v1';
+// Restore only into the active account, then verify cloud persistence.
+function restore(e){
+  const input=e.target,file=input.files&&input.files[0];
+  if(!file)return;
+  const sync=window.CABINET_SYNC,context=sync?.restoreContext?.();
+  if(!context){alert('Сначала дождись загрузки своего кабинета.');input.value='';return;}
+  const sameAccount=()=>sync.matchesContext(context);
+  input.disabled=true;
+  let status=$('restoreStatus');
+  if(!status){status=document.createElement('p');status.id='restoreStatus';status.setAttribute('role','status');status.setAttribute('aria-live','polite');input.parentElement.append(status);}
+  status.textContent='Проверяю файл резервной копии…';
+  const reader=new FileReader();
+  reader.onerror=()=>{status.textContent='Не удалось прочитать файл. Текущие данные сохранены.';input.disabled=false;input.value='';};
+  reader.onload=async()=>{
+    let previous=null,attempted=false;
+    try{
+      if(!sameAccount())throw new Error('Аккаунт сменился. Выбери файл заново в нужном аккаунте.');
+      const checked=validateBackup(JSON.parse(reader.result)),candidate=checked.data;
+      const legacy=checked.version===1?JSON.parse(reader.result):null;
+      previous={data:lastSavedData,greeting:{...greetingSettings},greetingError:greetingSettingsLoadError,theme:currentAppTheme(),keys:[KEY,GREETING_KEY,APP_THEME_KEY,'moikabinet_pending:'+context.id].map(key=>[key,localStorage.getItem(key)])};
+      if(legacy){
+        if(!legacy.profile)candidate.profile={...data.profile};
+        else if(!legacy.profile.theme)candidate.profile.theme=data.profile.theme;
+        for(const key of ['finance','inventory','diary','visitJournal','fileCategories','documents','documentTemplates','recommendations','inventoryMovements','protocols'])if(!Array.isArray(legacy[key]))candidate[key]=data[key]||candidate[key];
+        if(!legacy.followupSettings)candidate.followupSettings=data.followupSettings||candidate.followupSettings;
+      }
+      const nextGreeting=checked.settings?.greeting||previous.greeting,nextTheme=checked.settings?.theme||previous.theme;
+      candidate.profile=normalizeProfile({...candidate.profile,theme:nextTheme});
+      const serialized=JSON.stringify(candidate);
+      // Stage a durable per-account pending copy before any network request.
+      localStorage.setItem('moikabinet_pending:'+context.id,serialized);
+      localStorage.setItem(KEY,serialized);
+      if(checked.version===2){localStorage.setItem(GREETING_KEY,JSON.stringify(nextGreeting));localStorage.setItem(APP_THEME_KEY,nextTheme);}
+      data=candidate;lastSavedData=serialized;greetingSettings=nextGreeting;greetingSettingsLoadError='';startupStorageError='';
+      setAppTheme(nextTheme,false);renderGreeting();renderGreetingSettings();renderAll();
+      status.textContent='Данные восстановлены на этом устройстве. Проверяю сохранение в облаке…';
+      const result=await sync.restoreSnapshot(candidate,context);attempted=result.attempted===true;
+      if(!sameAccount())return;
+      if(!result.confirmed){
+        if(!attempted)throw new Error(result.error||'Облачное сохранение не началось.');
+        status.textContent='Данные восстановлены локально. Облако пока не подтвердило сохранение; копия ожидает синхронизации.';
+        alert('Данные восстановлены на этом устройстве. Облако пока не подтвердило сохранение. Файл и локальная копия сохранены; восстановление в облаке ещё не завершено.');
+        return;
+      }
+      status.textContent='Данные и настройки восстановлены и подтверждены в облаке.';
+      alert('Данные и настройки восстановлены и подтверждены в облаке.');
+    }catch(error){
+      if(!sameAccount())return;
+      if(previous&&!attempted){
+        for(const [key,value]of previous.keys)setStorageValue(key,value);
+        data=JSON.parse(previous.data);lastSavedData=previous.data;greetingSettings=previous.greeting;greetingSettingsLoadError=previous.greetingError;
+        setAppTheme(previous.theme,false);
+        for(const [key,value]of previous.keys)setStorageValue(key,value);
+        renderGreeting();renderGreetingSettings();renderAll();
+      }
+      status.textContent='Восстановление не завершено: '+error.message;
+      alert(status.textContent);
+    }finally{input.disabled=false;input.value='';}
+  };
+  reader.readAsText(file);
+}
+
+const APP_THEME_KEY='moikabinet_theme_v1';
 const APP_THEMES={original:'оригинальное синее с серебром',classic:'глубокое синее с серебром',sky:'нежно-голубое',cream:'тёплое бежевое',lavender:'нежную лавандовую',dark:'тёмно-синее',green:'свежее зелёное',purple:'насыщенное фиолетовое',lilac:'светло-фиолетовое',cherry:'вишнёвое',mint:'мятное',turquoise:'бирюзовое',peach:'персиковое',rose:'пудрово-розовое',terracotta:'терракотовое',graphite:'графитовое',sunshine:'солнечно-жёлтое',coral:'коралловое',aqua:'нежная аква',berry:'ягодное',black:'чёрное с серебром'};
 function setAppTheme(theme,saveProfile=true){if(!Object.prototype.hasOwnProperty.call(APP_THEMES,theme))theme='original';const previous=data.profile.theme||'original';data.profile.theme=theme;if(saveProfile&&!persistData()){data.profile=JSON.parse(lastSavedData).profile||data.profile;theme=data.profile.theme||previous}document.body.dataset.theme=theme;try{localStorage.setItem(APP_THEME_KEY,theme)}catch(e){}document.querySelectorAll('[data-theme-choice]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.themeChoice===theme)));const status=$('themeStatus');if(status)status.textContent='Применена тема: '+APP_THEMES[theme]+'.'}
 function initAppTheme(){let theme='original';try{theme=localStorage.getItem(APP_THEME_KEY)||data.profile.theme||'original'}catch(e){}data.profile.theme=theme;setAppTheme(theme,false)}
@@ -903,5 +965,5 @@ window.__cabinetActivate=(userId,value)=>{KEY=userId?'moikabinet_v1:'+userId:'mo
 initAppTheme();if(startupStorageError)alert(startupStorageError);$('profileForm')?.addEventListener('submit',saveProfile);renderProfile();
 $('greetingSettingsForm')?.addEventListener('submit',saveGreetingSettings);renderGreetingSettings();renderGreeting();$('integrationLinksForm')?.addEventListener('submit',saveIntegrationLinks);renderIntegrationLinks();$('today').textContent=new Date().toLocaleDateString('ru-RU',{day:'numeric',month:'long'});renderDailyThought();$('filterDate').value=today();calendarCursor=new Date();calendarCursor.setDate(1);if($('financeMonth'))$('financeMonth').value=today().slice(0,7);renderAll();setInterval(renderGreeting,60000);checkAppointmentReminders();setInterval(checkAppointmentReminders,30000);checkDiaryTaskReminders();setInterval(checkDiaryTaskReminders,30000);
 </script>
-<script type="module" src="supabase/cloud-sync.js?v=data-load-retry-1"></script>
+<script type="module" src="supabase/cloud-sync.js?v=cloud-restore-1"></script>
 </body></html>

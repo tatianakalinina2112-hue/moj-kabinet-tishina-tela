@@ -49,7 +49,7 @@ async function authFetch(input, options = {}) {
 }
 const supabase = createClient(cfg.url, cfg.publishableKey, { global: {fetch: authFetch}, auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false, flowType: 'pkce' } });
 let currentUser = null, timer = 0, poller = 0, applyingRemote = false, syncEnabled = false, lastCloudUpdate = '';
-let accountEpoch = 0, accountReady = false, authEventVersion = 0;
+let accountEpoch = 0, accountReady = false, authEventVersion = 0, restoreBusy = false;
 let writeQueue=Promise.resolve();
 const getData = () => window.__cabinetGetData?.();
 const setData = value => window.__cabinetSetData?.(value);
@@ -58,6 +58,7 @@ const pendingKey = id => 'moikabinet_pending:'+id;
 function isCurrent(id, epoch){return currentUser?.id===id&&accountEpoch===epoch;}
 function resetAccount(user=null){
   ++accountEpoch; accountReady=false; syncEnabled=false; applyingRemote=false;
+  restoreBusy=false;
   clearTimeout(timer);timer=0;clearInterval(poller);poller=0;lastCloudUpdate='';
   currentUser=user;
   document.getElementById('cloudSetup')?.remove();
@@ -184,28 +185,48 @@ function initialSyncChoice(user){
   const epoch=accountEpoch;
   wrap.querySelector('#cloudImport').addEventListener('click',async e=>{if(!isCurrent(user.id,epoch)||!accountReady)return;const button=e.currentTarget;button.disabled=true;syncEnabled=true;await saveSnapshot(user.id,epoch,JSON.stringify(getData()));if(!isCurrent(user.id,epoch))return;button.disabled=false;if(localStorage.getItem(pendingKey(user.id))){wrap.querySelector('#cloudSetupMsg').textContent='Облако не подтвердило сохранение. Локальная копия сохранена.';return;}wrap.remove();startPolling();});
 }
-function saveSnapshot(id,epoch,serialized){
-  const task=writeQueue.then(()=>writeSnapshot(id,epoch,serialized));
+function saveSnapshot(id,epoch,serialized,verify=false){
+  const task=writeQueue.then(()=>writeSnapshot(id,epoch,serialized,verify));
   writeQueue=task.catch(()=>{});return task;
 }
-async function writeSnapshot(id,epoch,serialized){
-  if(!isCurrent(id,epoch)||!accountReady||!syncEnabled)return;
+async function writeSnapshot(id,epoch,serialized,verify=false){
+  if(!isCurrent(id,epoch)||!accountReady||!syncEnabled)return{confirmed:false,attempted:false,error:'Аккаунт сменился или облако не подключено.'};
   // A newer edit may already be pending while this older write was queued.
-  if(!localStorage.getItem(pendingKey(id)))localStorage.setItem(pendingKey(id),serialized);
   const updated_at=new Date().toISOString();
+  let attempted=false;
   try{
+    if(!localStorage.getItem(pendingKey(id)))localStorage.setItem(pendingKey(id),serialized);
+    attempted=true;
     const {error}=await supabase.from('cabinet_state').upsert({user_id:id,snapshot:JSON.parse(serialized),updated_at},{onConflict:'user_id'});
-    if(!isCurrent(id,epoch))return;
+    if(!isCurrent(id,epoch))return{confirmed:false,attempted,error:'Аккаунт сменился.'};
     if(error)throw error;
+    if(verify){
+      const {data:row,error:readError}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',id).maybeSingle();
+      if(!isCurrent(id,epoch))return{confirmed:false,attempted,error:'Аккаунт сменился.'};
+      if(readError)throw readError;
+      const stable=value=>JSON.stringify(value,(_key,item)=>item&&typeof item==='object'&&!Array.isArray(item)?Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b))):item);
+      if(stable(row?.snapshot)!==stable(JSON.parse(serialized)))throw new Error('Облако не подтвердило восстановленную версию.');
+    }
     if(localStorage.getItem(pendingKey(id))===serialized)localStorage.removeItem(pendingKey(id));
     lastCloudUpdate=updated_at;setStatus('Синхронизировано · '+new Date().toLocaleTimeString('ru-RU'));
-  }catch(error){if(isCurrent(id,epoch))setStatus('Облачное сохранение не удалось: '+error.message,true);}
+    return{confirmed:true,attempted};
+  }catch(error){if(isCurrent(id,epoch))setStatus('Облачное сохранение не удалось: '+error.message,true);return{confirmed:false,attempted,error:error.message};}
 }
 window.CABINET_SYNC={
-  canWrite(){return !!currentUser&&accountReady;},
+  canWrite(){return !!currentUser&&accountReady&&!restoreBusy;},
+  restoreContext(){return currentUser&&accountReady&&!restoreBusy?{id:currentUser.id,epoch:accountEpoch}:null;},
+  matchesContext(context){return !!context&&isCurrent(context.id,context.epoch)&&accountReady;},
+  async restoreSnapshot(snapshot,context){
+    if(!context||!isCurrent(context.id,context.epoch)||!accountReady||!syncEnabled||restoreBusy)return{confirmed:false,attempted:false,error:'Дождись загрузки своего облачного кабинета.'};
+    const serialized=JSON.stringify(snapshot),id=context.id,epoch=context.epoch;
+    restoreBusy=true;clearTimeout(timer);timer=0;clearInterval(poller);poller=0;
+    try{localStorage.setItem(pendingKey(id),serialized);return await saveSnapshot(id,epoch,serialized,true);}
+    catch(error){return{confirmed:false,attempted:false,error:error.message};}
+    finally{if(isCurrent(id,epoch)){restoreBusy=false;startPolling();}}
+  },
   markPending(serialized){if(!currentUser||!accountReady)throw new Error('Account is locked');localStorage.setItem(pendingKey(currentUser.id),serialized);},
   save(snapshot){
-    if(!currentUser||!accountReady||!syncEnabled||applyingRemote)return;
+    if(!currentUser||!accountReady||!syncEnabled||applyingRemote||restoreBusy)return;
     const id=currentUser.id,epoch=accountEpoch,serialized=JSON.stringify(snapshot);
     clearTimeout(timer);setStatus('Сохраняю в облако…');
     timer=setTimeout(()=>{timer=0;return saveSnapshot(id,epoch,serialized);},650);

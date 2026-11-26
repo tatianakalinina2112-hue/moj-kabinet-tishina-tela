@@ -1,0 +1,23 @@
+const fs=require('fs'),vm=require('vm'),path=require('path'),assert=require('assert');
+const source=fs.readFileSync(path.join(__dirname,'../supabase/cloud-sync.js'),'utf8');
+const original=fs.readFileSync(path.join(__dirname,'account-isolation.cjs'),'utf8');
+const definitions=original.slice(original.indexOf('const clone='),original.indexOf('(async()=>{'));
+const context={core:source.slice(source.indexOf('let currentUser ='),source.indexOf('function authMessage(')),console,vm};
+vm.createContext(context);vm.runInContext(definitions,context);
+const make=context.browser,A='qa-a',B='qa-b';
+const snapshot={clients:[{id:1,name:'Вымышленный клиент',phone:'+70000000000'}],services:[],appointments:[]};
+(async()=>{
+ const server=new Map([[A,{snapshot:{clients:[],services:[],appointments:[]},updated_at:'2026-01-01'}]]);
+ const one=make(server);await one.hydrate(A);const result=await one.api.restoreSnapshot(snapshot,one.api.restoreContext());
+ assert(result.confirmed);assert(!one.storage.has('moikabinet_pending:'+A));
+ const other=make(server);await other.hydrate(A);assert.deepEqual(JSON.parse(JSON.stringify(other.ctx.visible.clients)),snapshot.clients);
+ const offline=make(new Map());await offline.hydrate(A);const originalFrom=offline.ctx.supabase.from;
+ offline.ctx.supabase.from=()=>({...originalFrom(),async upsert(){return{error:{message:'offline'}}}});
+ const failure=await offline.api.restoreSnapshot(snapshot,offline.api.restoreContext());assert(!failure.confirmed&&failure.attempted);assert.equal(JSON.parse(offline.storage.get('moikabinet_pending:'+A)).clients[0].phone,'+70000000000');
+ const uncertain=make(new Map());await uncertain.hydrate(A);uncertain.override(async()=>({data:null,error:{message:'readback failed'}}));const unconfirmed=await uncertain.api.restoreSnapshot(snapshot,uncertain.api.restoreContext());assert(!unconfirmed.confirmed&&unconfirmed.attempted);assert(uncertain.storage.has('moikabinet_pending:'+A));
+ const stale=one.api.restoreContext(),writes=one.writes.length;await one.hydrate(B);const denied=await one.api.restoreSnapshot(snapshot,stale);assert(!denied.confirmed&&!denied.attempted);assert.equal(one.writes.length,writes);
+ const q=make(new Map());await q.hydrate(A);let release;const qFrom=q.ctx.supabase.from;
+ q.ctx.supabase.from=()=>{const obj=qFrom();return{...obj,async upsert(row){await new Promise(resolve=>release=resolve);return obj.upsert(row)}}};
+ const qContext=q.api.restoreContext(),sending=q.api.restoreSnapshot(snapshot,qContext);assert.equal(q.api.canWrite(),false);const duplicate=await q.api.restoreSnapshot(snapshot,qContext);assert(!duplicate.attempted);while(!release)await new Promise(r=>setImmediate(r));release();assert((await sending).confirmed);assert(q.api.canWrite());
+ console.log('PASS: restore write/readback, separate context name+phone, offline/readback pending preservation, stale account and duplicate restore protection. Mock backend.');
+})().catch(error=>{console.error(error);process.exitCode=1});
