@@ -41,8 +41,25 @@ async function authFetch(input, options = {}) {
 }
 const supabase = createClient(cfg.url, cfg.publishableKey, { global: {fetch: authFetch}, auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false, flowType: 'pkce' } });
 let currentUser = null, timer = 0, poller = 0, applyingRemote = false, syncEnabled = false, lastCloudUpdate = '';
+let accountEpoch = 0, accountReady = false, authEventVersion = 0;
+let writeQueue=Promise.resolve();
 const getData = () => window.__cabinetGetData?.();
 const setData = value => window.__cabinetSetData?.(value);
+const cacheKey = id => 'moikabinet_v1:'+id;
+const pendingKey = id => 'moikabinet_pending:'+id;
+function isCurrent(id, epoch){return currentUser?.id===id&&accountEpoch===epoch;}
+function resetAccount(user=null){
+  ++accountEpoch; accountReady=false; syncEnabled=false; applyingRemote=false;
+  clearTimeout(timer);timer=0;clearInterval(poller);poller=0;lastCloudUpdate='';
+  currentUser=user;
+  document.getElementById('cloudSetup')?.remove();
+  document.getElementById('passwordSetup')?.remove();
+  window.__cabinetActivate?.(null,{});
+}
+function applySnapshot(id,snapshot){
+  applyingRemote=true;
+  try{window.__cabinetActivate(id,snapshot);}finally{applyingRemote=false;}
+}
 // Recovery links open in a new tab. sessionStorage is isolated per tab, so
 // remember only this UI intent (never credentials) across tabs of this origin.
 function markPasswordSetup(){localStorage.setItem('cabinet_password_setup',String(Date.now()));}
@@ -91,24 +108,75 @@ const gate = () => {
   });
 };
 async function hydrate(user) {
-  currentUser=user; syncEnabled=false; clearInterval(poller); if(!user){gate();setStatus('Supabase: ожидается вход');return;}
-  document.getElementById('cloudGate')?.remove(); setStatus('Загружаю данные кабинета…');
-  const {data:row,error}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',user.id).maybeSingle();
-  if(error){setStatus('Облачная загрузка не удалась: '+error.message,true);return;}
-  if(row?.snapshot){syncEnabled=true;lastCloudUpdate=row.updated_at;applyingRemote=true;try{setData(row.snapshot);localStorage.setItem('moikabinet_v1',JSON.stringify(row.snapshot));}finally{applyingRemote=false;}setStatus('Синхронизировано · '+new Date(row.updated_at).toLocaleString('ru-RU'));startPolling();}
-  else {setStatus('Облачной копии пока нет. Данные с этого устройства не отправлены.');initialSyncChoice(user);}
+  resetAccount(user);gate();
+  if(!user){setStatus('Supabase: ожидается вход');return;}
+  const id=user.id,epoch=accountEpoch;
+  setStatus('Загружаю данные кабинета…');
+  try{
+    const {data:row,error}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',id).maybeSingle();
+    if(!isCurrent(id,epoch))return;
+    if(error)throw error;
+    const pending=localStorage.getItem(pendingKey(id));
+    const ownLocal=localStorage.getItem(cacheKey(id))||(id===cfg.legacyOwnerId?localStorage.getItem('moikabinet_legacy:'+id):null);
+    const snapshot=pending?JSON.parse(pending):row?.snapshot||(ownLocal?JSON.parse(ownLocal):{});
+    applySnapshot(id,snapshot);accountReady=true;
+    document.getElementById('cloudGate')?.remove();
+    if(row?.snapshot||!ownLocal){
+      syncEnabled=true;lastCloudUpdate=row?.updated_at||'';
+      setStatus('Свои данные загружены.');startPolling();
+      if(pending)window.CABINET_SYNC.save(snapshot);
+    }else{setStatus('Своя локальная копия сохранена. Выбери подключение синхронизации.');initialSyncChoice(user);}
+  }catch(error){if(isCurrent(id,epoch)){resetAccount(user);gate();setStatus('Облачная загрузка не удалась: '+error.message,true);}}
 }
-function startPolling(){clearInterval(poller);poller=setInterval(async()=>{if(!currentUser||!syncEnabled||timer)return;const {data:fresh,error:pollError}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',currentUser.id).maybeSingle();if(pollError){setStatus('Проверка синхронизации не удалась: '+pollError.message,true);return;}if(fresh?.snapshot&&fresh.updated_at>lastCloudUpdate){lastCloudUpdate=fresh.updated_at;applyingRemote=true;try{setData(fresh.snapshot);localStorage.setItem('moikabinet_v1',JSON.stringify(fresh.snapshot));setStatus('Получены изменения с другого устройства · '+new Date().toLocaleTimeString('ru-RU'));}finally{applyingRemote=false;}}},5000);}
+function startPolling(){
+  clearInterval(poller);const id=currentUser.id,epoch=accountEpoch;
+  poller=setInterval(async()=>{
+    if(!isCurrent(id,epoch)||!syncEnabled||timer||localStorage.getItem(pendingKey(id)))return;
+    try{
+      const {data:fresh,error}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',id).maybeSingle();
+      if(!isCurrent(id,epoch)||localStorage.getItem(pendingKey(id)))return;
+      if(error)throw error;
+      if(fresh?.snapshot&&fresh.updated_at>lastCloudUpdate){applySnapshot(id,fresh.snapshot);lastCloudUpdate=fresh.updated_at;setStatus('Получены изменения с другого устройства.');}
+    }catch(error){if(isCurrent(id,epoch))setStatus('Проверка синхронизации не удалась: '+error.message,true);}
+  },5000);
+}
 function initialSyncChoice(user){
   document.getElementById('cloudSetup')?.remove();
   const wrap=document.createElement('div');wrap.id='cloudSetup';
-  wrap.innerHTML='<div class="cloud-card"><h2>Подключить синхронизацию?</h2><p>В облаке пока нет копии. В кабинете на этом устройстве сейчас есть данные. Выбери, переносить ли их в защищённое хранилище Supabase. Ничего не отправится, пока ты не нажмёшь кнопку переноса.</p><div class="cloud-actions"><button id="cloudImport" class="btn gold" type="button">Перенести данные в облако</button><button id="cloudLocal" class="btn light" type="button">Пока оставить только на этом устройстве</button></div><p id="cloudSetupMsg" role="status"></p></div>';
+  wrap.innerHTML='<div class="cloud-card"><h2>Подключить синхронизацию?</h2><p>Найдена локальная копия только этого аккаунта. Её можно перенести в свою облачную копию.</p><div class="cloud-actions"><button id="cloudImport" class="btn gold" type="button">Перенести свои данные в облако</button><button id="cloudLocal" class="btn light" type="button">Пока оставить только на этом устройстве</button></div><p id="cloudSetupMsg" role="status"></p></div>';
   Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'9998',display:'grid',placeItems:'center',padding:'20px',background:'#071d31eF'});
   const style=document.createElement('style');style.textContent='#cloudSetup .cloud-card{width:min(500px,100%);padding:24px;border-radius:22px;background:#eff8fd;color:#123653;box-shadow:0 20px 60px #0006}#cloudSetup h2{margin-top:0}#cloudSetup p{line-height:1.55}#cloudSetup .cloud-actions{display:grid;gap:10px}';document.head.append(style);document.body.append(wrap);
   wrap.querySelector('#cloudLocal').addEventListener('click',()=>{wrap.remove();setStatus('Данные остаются на этом устройстве. Синхронизация пока выключена.');});
-  wrap.querySelector('#cloudImport').addEventListener('click',async e=>{const button=e.currentTarget;button.disabled=true;wrap.querySelector('#cloudSetupMsg').textContent='Переношу данные…';const updated_at=new Date().toISOString();const {error}=await supabase.from('cabinet_state').upsert({user_id:user.id,snapshot:getData(),updated_at},{onConflict:'user_id'});button.disabled=false;if(error){wrap.querySelector('#cloudSetupMsg').textContent='Не удалось перенести данные: '+error.message;return;}syncEnabled=true;lastCloudUpdate=updated_at;wrap.remove();setStatus('Первая облачная копия создана.');startPolling();});
+  const epoch=accountEpoch;
+  wrap.querySelector('#cloudImport').addEventListener('click',async e=>{if(!isCurrent(user.id,epoch)||!accountReady)return;const button=e.currentTarget;button.disabled=true;syncEnabled=true;await saveSnapshot(user.id,epoch,JSON.stringify(getData()));if(!isCurrent(user.id,epoch))return;button.disabled=false;if(localStorage.getItem(pendingKey(user.id))){wrap.querySelector('#cloudSetupMsg').textContent='Облако не подтвердило сохранение. Локальная копия сохранена.';return;}wrap.remove();startPolling();});
 }
-window.CABINET_SYNC={save(snapshot){if(!currentUser||!syncEnabled||applyingRemote)return;clearTimeout(timer);setStatus('Сохраняю в облако…');timer=setTimeout(async()=>{const updated_at=new Date().toISOString();const {error}=await supabase.from('cabinet_state').upsert({user_id:currentUser.id,snapshot,updated_at},{onConflict:'user_id'});if(!error)lastCloudUpdate=updated_at;setStatus(error?'Облачное сохранение не удалось: '+error.message:'Синхронизировано · '+new Date().toLocaleTimeString('ru-RU'),!!error);},650);},async signOut(){syncEnabled=false;await supabase.auth.signOut();}};
+function saveSnapshot(id,epoch,serialized){
+  const task=writeQueue.then(()=>writeSnapshot(id,epoch,serialized));
+  writeQueue=task.catch(()=>{});return task;
+}
+async function writeSnapshot(id,epoch,serialized){
+  if(!isCurrent(id,epoch)||!accountReady||!syncEnabled)return;
+  localStorage.setItem(pendingKey(id),serialized);
+  const updated_at=new Date().toISOString();
+  try{
+    const {error}=await supabase.from('cabinet_state').upsert({user_id:id,snapshot:JSON.parse(serialized),updated_at},{onConflict:'user_id'});
+    if(!isCurrent(id,epoch))return;
+    if(error)throw error;
+    if(localStorage.getItem(pendingKey(id))===serialized)localStorage.removeItem(pendingKey(id));
+    lastCloudUpdate=updated_at;setStatus('Синхронизировано · '+new Date().toLocaleTimeString('ru-RU'));
+  }catch(error){if(isCurrent(id,epoch))setStatus('Облачное сохранение не удалось: '+error.message,true);}
+}
+window.CABINET_SYNC={
+  canWrite(){return !!currentUser&&accountReady;},
+  markPending(serialized){if(!currentUser||!accountReady)throw new Error('Account is locked');localStorage.setItem(pendingKey(currentUser.id),serialized);},
+  save(snapshot){
+    if(!currentUser||!accountReady||!syncEnabled||applyingRemote)return;
+    const id=currentUser.id,epoch=accountEpoch,serialized=JSON.stringify(snapshot);
+    clearTimeout(timer);setStatus('Сохраняю в облако…');
+    timer=setTimeout(()=>{timer=0;return saveSnapshot(id,epoch,serialized);},650);
+  },
+  async signOut(){resetAccount();clearPasswordSetup();gate();setStatus('Supabase: ожидается вход');const {error}=await supabase.auth.signOut();if(error)setStatus('Данные скрыты. Сервер не подтвердил выход: '+error.message,true);}
+};
 
 function authMessage(error){
   const message=error?.message||'';
@@ -139,7 +207,15 @@ function showPasswordSetup(){
 }
 
 let authReady = false;
-supabase.auth.onAuthStateChange((event,session)=>{if(event==='PASSWORD_RECOVERY')markPasswordSetup();if(authReady)setTimeout(()=>{if(session?.user&&wantsPasswordSetup())showPasswordSetup();else hydrate(session?.user||null);},0);});
+supabase.auth.onAuthStateChange((event,session)=>{
+  const version=++authEventVersion;
+  if(event==='PASSWORD_RECOVERY')markPasswordSetup();
+  if(!authReady)return;
+  // Clear private state immediately, including on a sign-out from another tab.
+  if(!session?.user||session.user.id!==currentUser?.id)resetAccount(session?.user||null);
+  if(event==='TOKEN_REFRESHED'&&accountReady&&session?.user?.id===currentUser?.id)return;
+  setTimeout(()=>{if(version!==authEventVersion)return;if(session?.user&&wantsPasswordSetup())showPasswordSetup();else hydrate(session?.user||null);},0);
+});
 // Parse the callback immediately; auth events below update the page once Supabase
 // has exchanged the one-time link for a session.
 const callbackParams = new URLSearchParams(location.hash.slice(1));
