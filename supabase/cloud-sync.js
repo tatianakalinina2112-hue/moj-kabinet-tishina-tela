@@ -51,19 +51,89 @@ const supabase = createClient(cfg.url, cfg.publishableKey, { global: {fetch: aut
 let currentUser = null, timer = 0, poller = 0, applyingRemote = false, syncEnabled = false, lastCloudUpdate = '';
 let accountEpoch = 0, accountReady = false, authEventVersion = 0, restoreBusy = false;
 let writeQueue=Promise.resolve();
+let syncConflict=false,editContext=null,normalBranch='',branchCounter=0;
+const branchVersions=new Map();
+const metaKey=id=>'moikabinet_pending_version:'+id;
+const conflictKey=id=>'moikabinet_conflict:'+id;
+const formDraftKey=id=>'moikabinet_form_draft:'+id;
+const archiveKey=id=>'moikabinet_conflict_archive:'+id;
+const stableSnapshot=value=>JSON.stringify(value,(_key,item)=>item&&typeof item==='object'&&!Array.isArray(item)?Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b))):item);
+function readJson(key){try{return JSON.parse(localStorage.getItem(key)||'null')}catch{return null}}
+function freshContext(version=lastCloudUpdate||null){return{id:currentUser?.id,epoch:accountEpoch,baseVersion:version,branch:globalThis.crypto?.randomUUID?.()||String(Date.now())+':'+(++branchCounter)}}
+function adoptVersion(version){lastCloudUpdate=version||'';const context=freshContext(version||null);normalBranch=context.branch;branchVersions.set(normalBranch,version||null);editContext=null;}
+function normalContext(){return editContext||{id:currentUser?.id,epoch:accountEpoch,baseVersion:lastCloudUpdate||null,branch:normalBranch};}
+function expectedVersion(context){return branchVersions.has(context.branch)?branchVersions.get(context.branch):context.baseVersion;}
+function captureEditorDraft(context=normalContext()){
+  if(!currentUser||!isCurrent(context.id,context.epoch))return null;
+  const draft=window.__cabinetCaptureEditor?.();if(!draft)return null;
+  const value={...draft,baseVersion:expectedVersion(context),savedAt:new Date().toISOString()};
+  localStorage.setItem(formDraftKey(currentUser.id),JSON.stringify(value));return value;
+}
+function draftText(){
+  if(!currentUser)return'';
+  const id=currentUser.id,archive=readJson(archiveKey(id));
+  const form=readJson(formDraftKey(id))||archive?.form;
+  if(form?.fields)return Object.entries(form.fields).map(([key,value])=>key+': '+value).join('\n');
+  const raw=localStorage.getItem(pendingKey(id))||archive?.snapshotJSON;
+  if(!raw)return'';
+  try{return JSON.stringify(JSON.parse(raw),null,2)}catch{return raw;}
+}
+function conflictPanel(archived=false){
+  if(!currentUser)return;
+  document.getElementById('cloudConflict')?.remove();
+  const id=currentUser.id,epoch=accountEpoch,wrap=document.createElement('div');wrap.id='cloudConflict';wrap.setAttribute('role','alert');
+  Object.assign(wrap.style,{position:'fixed',right:'12px',bottom:'88px',zIndex:'10003',width:'min(460px,calc(100vw - 24px))',boxSizing:'border-box',maxHeight:'65vh',overflowY:'auto',padding:'18px',borderRadius:'16px',background:'#fff4dc',color:'#493713',boxShadow:'0 8px 30px #0005'});
+  wrap.innerHTML='<strong id="cloudConflictTitle"></strong><p id="cloudConflictMessage" style="line-height:1.5"></p><div style="display:flex;gap:8px;flex-wrap:wrap"><button id="cloudDraftShow" class="btn light" type="button">Мои правки</button><button id="cloudFreshLoad" class="btn light" type="button">Загрузить свежую версию</button><button id="cloudConflictClose" class="btn light" type="button">Закрыть</button></div><textarea id="cloudConflictDraft" readonly hidden aria-label="Сохранённые правки" style="width:100%;min-height:150px;margin-top:12px;box-sizing:border-box"></textarea>';
+  wrap.querySelector('#cloudConflictTitle').textContent=archived?'Свежая версия загружена':'Данные изменились на другом устройстве';
+  wrap.querySelector('#cloudConflictMessage').textContent=archived?'Предыдущий введённый текст сохранён отдельно. Открой «Мои правки», чтобы перенести нужные изменения.':'Сохранение в облако остановлено: эта версия устарела. Ваши правки сохранены на этом устройстве. Перед продолжением загрузите свежую версию.';
+  wrap.querySelector('#cloudFreshLoad').hidden=archived;
+  wrap.querySelector('#cloudDraftShow').addEventListener('click',()=>{if(!isCurrent(id,epoch))return;const text=wrap.querySelector('#cloudConflictDraft');text.value=draftText();text.hidden=false;});
+  wrap.querySelector('#cloudFreshLoad').addEventListener('click',async()=>{if(!isCurrent(id,epoch))return;const button=wrap.querySelector('#cloudFreshLoad');button.disabled=true;const result=await loadLatest();if(!result.confirmed&&isCurrent(id,epoch)){wrap.querySelector('#cloudConflictMessage').textContent=result.error;button.disabled=false;}});
+  wrap.querySelector('#cloudConflictClose').addEventListener('click',()=>wrap.remove());document.body.append(wrap);
+}
+function flagConflict(id,baseVersion,serverVersion=null){
+  syncConflict=true;clearTimeout(timer);timer=0;
+  try{captureEditorDraft();localStorage.setItem(conflictKey(id),JSON.stringify({baseVersion,serverVersion,time:new Date().toISOString()}));}catch{}
+  setStatus('Конфликт версий: правки сохранены локально, облако не перезаписано.',true);conflictPanel();
+}
+function markPendingVersion(serialized,context=normalContext()){
+  if(!context||!isCurrent(context.id,context.epoch)||!accountReady)throw new Error('Аккаунт сменился или ещё не загружен.');
+  captureEditorDraft(context);
+  if(!syncConflict)localStorage.setItem(metaKey(context.id),JSON.stringify({...context,baseVersion:expectedVersion(context)}));
+  localStorage.setItem(pendingKey(context.id),serialized);
+}
+async function loadLatest(){
+  if(!currentUser||!accountReady||restoreBusy)return{confirmed:false,error:'Дождись загрузки аккаунта.'};
+  const id=currentUser.id,epoch=accountEpoch;
+  try{
+    captureEditorDraft();
+    const archive={snapshotJSON:localStorage.getItem(pendingKey(id)),form:readJson(formDraftKey(id)),version:readJson(metaKey(id)),savedAt:new Date().toISOString()};
+    const prior=localStorage.getItem(archiveKey(id));if(prior)localStorage.setItem(archiveKey(id)+':'+Date.now(),prior);
+    localStorage.setItem(archiveKey(id),JSON.stringify(archive));
+    const {data:row,error}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',id).maybeSingle();
+    if(!isCurrent(id,epoch))return{confirmed:false,error:'Аккаунт сменился.'};
+    if(error)throw error;if(!row?.snapshot)throw new Error('Облачная копия не найдена. Ваши правки сохранены локально.');
+    clearTimeout(timer);timer=0;localStorage.removeItem(pendingKey(id));localStorage.removeItem(metaKey(id));localStorage.removeItem(conflictKey(id));localStorage.removeItem(formDraftKey(id));
+    syncConflict=false;adoptVersion(row.updated_at);applySnapshot(id,row.snapshot);setStatus('Свежая версия загружена. Предыдущие правки сохранены отдельно.');conflictPanel(true);return{confirmed:true};
+  }catch(error){return{confirmed:false,error:'Свежую версию не удалось загрузить: '+error.message+'. Ваши правки не удалены.'};}
+}
+document.addEventListener?.('input',()=>{if(currentUser&&accountReady){try{captureEditorDraft()}catch{setStatus('Не удалось сохранить черновик. Скопируй введённый текст перед закрытием.',true)}}},true);
+
 const getData = () => window.__cabinetGetData?.();
 const setData = value => window.__cabinetSetData?.(value);
 const cacheKey = id => 'moikabinet_v1:'+id;
 const pendingKey = id => 'moikabinet_pending:'+id;
 function isCurrent(id, epoch){return currentUser?.id===id&&accountEpoch===epoch;}
 function resetAccount(user=null){
+  try{captureEditorDraft()}catch{}
   ++accountEpoch; accountReady=false; syncEnabled=false; applyingRemote=false;
-  restoreBusy=false;
+  restoreBusy=false;syncConflict=false;editContext=null;normalBranch='';branchVersions.clear();
   clearTimeout(timer);timer=0;clearInterval(poller);poller=0;lastCloudUpdate='';
   currentUser=user;
   document.getElementById('cloudSetup')?.remove();
   document.getElementById('passwordSetup')?.remove();
   document.getElementById('cloudLoadGate')?.remove();
+  document.getElementById('cloudConflict')?.remove();
   window.__cabinetActivate?.(null,{});
 }
 function applySnapshot(id,snapshot){
@@ -150,28 +220,39 @@ async function hydrate(user) {
     const {data:row,error}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',id).maybeSingle();
     if(!isCurrent(id,epoch))return;
     if(error)throw error;
-    const pending=localStorage.getItem(pendingKey(id));
+    let pending=localStorage.getItem(pendingKey(id));
+    const meta=readJson(metaKey(id)),savedConflict=readJson(conflictKey(id));
+    if(pending&&row?.snapshot&&stableSnapshot(JSON.parse(pending))===stableSnapshot(row.snapshot)){
+      localStorage.removeItem(pendingKey(id));localStorage.removeItem(metaKey(id));localStorage.removeItem(conflictKey(id));pending=null;
+    }
     const ownLocal=localStorage.getItem(cacheKey(id))||(id===cfg.legacyOwnerId?localStorage.getItem('moikabinet_legacy:'+id):null);
-    const snapshot=pending?JSON.parse(pending):row?.snapshot||(ownLocal?JSON.parse(ownLocal):{});
+    const stalePending=!!pending&&(!meta||meta.baseVersion!==(row?.updated_at||null));
+    const hasConflict=stalePending||(!pending&&!!savedConflict);
+    const snapshot=pending?JSON.parse(pending):hasConflict&&ownLocal?JSON.parse(ownLocal):row?.snapshot||(ownLocal?JSON.parse(ownLocal):{});
+    adoptVersion(pending?(meta?.baseVersion||null):(row?.updated_at||null));
     applySnapshot(id,snapshot);accountReady=true;
     document.getElementById('cloudGate')?.remove();
     document.getElementById('cloudLoadGate')?.remove();
     if(row?.snapshot||!ownLocal){
-      syncEnabled=true;lastCloudUpdate=row?.updated_at||'';
+      syncEnabled=true;
       setStatus('Свои данные загружены.');startPolling();
-      if(pending)window.CABINET_SYNC.save(snapshot);
+      if(hasConflict)flagConflict(id,meta?.baseVersion||savedConflict?.baseVersion||null,row?.updated_at||null);
+      else if(pending)window.CABINET_SYNC.save(snapshot);else if(readJson(archiveKey(id)))conflictPanel(true);
     }else{setStatus('Своя локальная копия сохранена. Выбери подключение синхронизации.');initialSyncChoice(user);}
   }catch(error){if(isCurrent(id,epoch)){resetAccount(user);showDataLoad(user,accountEpoch,true);setStatus('Облачная загрузка не удалась: '+error.message,true);}}
 }
 function startPolling(){
   clearInterval(poller);const id=currentUser.id,epoch=accountEpoch;
   poller=setInterval(async()=>{
-    if(!isCurrent(id,epoch)||!syncEnabled||timer||localStorage.getItem(pendingKey(id)))return;
+    if(!isCurrent(id,epoch)||!syncEnabled||syncConflict||restoreBusy||timer||localStorage.getItem(pendingKey(id)))return;
     try{
       const {data:fresh,error}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',id).maybeSingle();
       if(!isCurrent(id,epoch)||localStorage.getItem(pendingKey(id)))return;
       if(error)throw error;
-      if(fresh?.snapshot&&fresh.updated_at>lastCloudUpdate){applySnapshot(id,fresh.snapshot);lastCloudUpdate=fresh.updated_at;setStatus('Получены изменения с другого устройства.');}
+      if(fresh?.snapshot&&fresh.updated_at!==lastCloudUpdate){
+        if(window.__cabinetHasOpenEditor?.()){flagConflict(id,lastCloudUpdate||null,fresh.updated_at);return;}
+        applySnapshot(id,fresh.snapshot);adoptVersion(fresh.updated_at);setStatus('Получены изменения с другого устройства.');
+      }
     }catch(error){if(isCurrent(id,epoch))setStatus('Проверка синхронизации не удалась: '+error.message,true);}
   },5000);
 }
@@ -185,51 +266,73 @@ function initialSyncChoice(user){
   const epoch=accountEpoch;
   wrap.querySelector('#cloudImport').addEventListener('click',async e=>{if(!isCurrent(user.id,epoch)||!accountReady)return;const button=e.currentTarget;button.disabled=true;syncEnabled=true;await saveSnapshot(user.id,epoch,JSON.stringify(getData()));if(!isCurrent(user.id,epoch))return;button.disabled=false;if(localStorage.getItem(pendingKey(user.id))){wrap.querySelector('#cloudSetupMsg').textContent='Облако не подтвердило сохранение. Локальная копия сохранена.';return;}wrap.remove();startPolling();});
 }
-function saveSnapshot(id,epoch,serialized,verify=false){
-  const task=writeQueue.then(()=>writeSnapshot(id,epoch,serialized,verify));
+function saveSnapshot(id,epoch,serialized,verify=false,context=normalContext()){
+  const task=writeQueue.then(()=>writeSnapshot(id,epoch,serialized,verify,context));
   writeQueue=task.catch(()=>{});return task;
 }
-async function writeSnapshot(id,epoch,serialized,verify=false){
+async function writeSnapshot(id,epoch,serialized,verify=false,context=normalContext()){
   if(!isCurrent(id,epoch)||!accountReady||!syncEnabled)return{confirmed:false,attempted:false,error:'Аккаунт сменился или облако не подключено.'};
+  if(syncConflict){conflictPanel();return{confirmed:false,attempted:false,conflict:true,error:'Версия устарела. Правки сохранены локально.'};}
   // A newer edit may already be pending while this older write was queued.
-  const updated_at=new Date().toISOString();
+  const baseVersion=expectedVersion(context);
+  const updated_at=new Date(Math.max(Date.now(),baseVersion?Date.parse(baseVersion)+1:0)).toISOString();
   let attempted=false;
   try{
     if(!localStorage.getItem(pendingKey(id)))localStorage.setItem(pendingKey(id),serialized);
     attempted=true;
-    const {error}=await supabase.from('cabinet_state').upsert({user_id:id,snapshot:JSON.parse(serialized),updated_at},{onConflict:'user_id'});
+    if(!localStorage.getItem(metaKey(id)))localStorage.setItem(metaKey(id),JSON.stringify({...context,baseVersion}));
+    const table=supabase.from('cabinet_state');
+    const mutation=baseVersion===null?table.insert({user_id:id,snapshot:JSON.parse(serialized),updated_at}):table.update({snapshot:JSON.parse(serialized),updated_at}).eq('user_id',id).eq('updated_at',baseVersion);
+    const {data:written,error}=await mutation.select('snapshot,updated_at');
     if(!isCurrent(id,epoch))return{confirmed:false,attempted,error:'Аккаунт сменился.'};
-    if(error)throw error;
-    if(verify){
-      const {data:row,error:readError}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',id).maybeSingle();
+    if(error&&error.code!=='23505')throw error;
+    let row=Array.isArray(written)?written[0]:written;
+    if(!row){
+      const {data:fresh,error:readError}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',id).maybeSingle();
       if(!isCurrent(id,epoch))return{confirmed:false,attempted,error:'Аккаунт сменился.'};
       if(readError)throw readError;
-      const stable=value=>JSON.stringify(value,(_key,item)=>item&&typeof item==='object'&&!Array.isArray(item)?Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b))):item);
-      if(stable(row?.snapshot)!==stable(JSON.parse(serialized)))throw new Error('Облако не подтвердило восстановленную версию.');
+      if(fresh?.snapshot&&stableSnapshot(fresh.snapshot)===stableSnapshot(JSON.parse(serialized)))row=fresh;
+      else{flagConflict(id,baseVersion,fresh?.updated_at||null);return{confirmed:false,attempted,conflict:true,error:'Данные изменились на другом устройстве. Ваши правки сохранены локально.'};}
     }
-    if(localStorage.getItem(pendingKey(id))===serialized)localStorage.removeItem(pendingKey(id));
-    lastCloudUpdate=updated_at;setStatus('Синхронизировано · '+new Date().toLocaleTimeString('ru-RU'));
+    if(verify){
+      const {data:fresh,error:readError}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',id).maybeSingle();
+      if(!isCurrent(id,epoch))return{confirmed:false,attempted,error:'Аккаунт сменился.'};
+      if(readError)throw readError;
+      if(stableSnapshot(fresh?.snapshot)!==stableSnapshot(JSON.parse(serialized))){flagConflict(id,baseVersion,fresh?.updated_at||null);return{confirmed:false,attempted,conflict:true,error:'После записи данные изменились. Файл сохранён локально.'};}
+      row=fresh;
+    }
+    branchVersions.set(context.branch,row.updated_at);lastCloudUpdate=row.updated_at;
+    if(localStorage.getItem(pendingKey(id))===serialized){localStorage.removeItem(pendingKey(id));localStorage.removeItem(metaKey(id));localStorage.removeItem(conflictKey(id));}
+    else{const next=readJson(metaKey(id));if(next?.branch===context.branch&&next.baseVersion===baseVersion)localStorage.setItem(metaKey(id),JSON.stringify({...next,baseVersion:row.updated_at}));}
+    setStatus('Синхронизировано · '+new Date().toLocaleTimeString('ru-RU'));
     return{confirmed:true,attempted};
   }catch(error){if(isCurrent(id,epoch))setStatus('Облачное сохранение не удалось: '+error.message,true);return{confirmed:false,attempted,error:error.message};}
 }
 window.CABINET_SYNC={
   canWrite(){return !!currentUser&&accountReady&&!restoreBusy;},
-  restoreContext(){return currentUser&&accountReady&&!restoreBusy?{id:currentUser.id,epoch:accountEpoch}:null;},
+  restoreContext(){return currentUser&&accountReady&&!restoreBusy?freshContext():null;},
+  captureWriteContext(){return currentUser&&accountReady?freshContext():null;},
+  beginEdit(){if(currentUser&&accountReady)editContext=normalContext();},
+  endEdit(){editContext=null;},
+  hasConflict(){return syncConflict;},
+  draftText,loadLatest,
   matchesContext(context){return !!context&&isCurrent(context.id,context.epoch)&&accountReady;},
   async restoreSnapshot(snapshot,context){
-    if(!context||!isCurrent(context.id,context.epoch)||!accountReady||!syncEnabled||restoreBusy)return{confirmed:false,attempted:false,error:'Дождись загрузки своего облачного кабинета.'};
+    if(!context||!isCurrent(context.id,context.epoch)||!accountReady||!syncEnabled||restoreBusy||syncConflict)return{confirmed:false,attempted:false,error:'Сначала загрузи свежую версию своего кабинета.'};
     const serialized=JSON.stringify(snapshot),id=context.id,epoch=context.epoch;
     restoreBusy=true;clearTimeout(timer);timer=0;clearInterval(poller);poller=0;
-    try{localStorage.setItem(pendingKey(id),serialized);return await saveSnapshot(id,epoch,serialized,true);}
+    try{markPendingVersion(serialized,context);return await saveSnapshot(id,epoch,serialized,true,context);}
     catch(error){return{confirmed:false,attempted:false,error:error.message};}
     finally{if(isCurrent(id,epoch)){restoreBusy=false;startPolling();}}
   },
-  markPending(serialized){if(!currentUser||!accountReady)throw new Error('Account is locked');localStorage.setItem(pendingKey(currentUser.id),serialized);},
-  save(snapshot){
+  markPending:markPendingVersion,
+  save(snapshot,context=normalContext()){
     if(!currentUser||!accountReady||!syncEnabled||applyingRemote||restoreBusy)return;
     const id=currentUser.id,epoch=accountEpoch,serialized=JSON.stringify(snapshot);
+    markPendingVersion(serialized,context);
+    if(syncConflict){conflictPanel();return;}
     clearTimeout(timer);setStatus('Сохраняю в облако…');
-    timer=setTimeout(()=>{timer=0;return saveSnapshot(id,epoch,serialized);},650);
+    timer=setTimeout(()=>{timer=0;return saveSnapshot(id,epoch,serialized,false,context);},650);
   },
   async signOut(){resetAccount();clearPasswordSetup();gate();setStatus('Supabase: ожидается вход');const {error}=await supabase.auth.signOut();if(error)setStatus('Данные скрыты. Сервер не подтвердил выход: '+error.message,true);}
 };
@@ -269,7 +372,7 @@ supabase.auth.onAuthStateChange((event,session)=>{
   if(!authReady)return;
   // Clear private state immediately, including on a sign-out from another tab.
   if(!session?.user||session.user.id!==currentUser?.id)resetAccount(session?.user||null);
-  if(event==='TOKEN_REFRESHED'&&accountReady&&session?.user?.id===currentUser?.id)return;
+  if((event==='TOKEN_REFRESHED'||event==='SIGNED_IN')&&accountReady&&session?.user?.id===currentUser?.id)return;
   setTimeout(()=>{if(version!==authEventVersion)return;if(session?.user&&wantsPasswordSetup())showPasswordSetup();else hydrate(session?.user||null);},0);
 });
 // Parse the callback immediately; auth events below update the page once Supabase

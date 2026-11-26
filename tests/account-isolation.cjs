@@ -10,7 +10,10 @@ function browser(server,storage=new Map()){
  const context={cfg:{legacyOwnerId:legacyOwner},window:{},document:{getElementById(id){return nodes.get(id)||null},createElement(){const el=node();el.remove=()=>nodes.delete(el.id);return el},head:{append(){}},body:{append(el){nodes.set(el.id,el)}}},localStorage:{getItem:k=>storage.get(k)??null,setItem:(k,v)=>storage.set(k,String(v)),removeItem:k=>storage.delete(k)},sessionStorage:{removeItem(){}},setStatus(){},setTimeout(fn){timers.set(++n,fn);return n},clearTimeout(id){timers.delete(id)},setInterval(fn){polls.set(++n,fn);return n},clearInterval(id){polls.delete(id)},Promise,Date,JSON,console};
  context.window.__cabinetGetData=()=>context.visible;
  context.window.__cabinetActivate=(id,value)=>{context.visible={clients:[],services:[],appointments:[],...clone(value)};context.active=id;if(id)storage.set('moikabinet_v1:'+id,JSON.stringify(context.visible))};
- context.supabase={auth:{async signOut(){return{error:null}}},from(){return{select(){return{eq(column,id){return{async maybeSingle(){if(readOverride)return readOverride(id);return{data:clone(server.get(id)||null),error:null}}}}}},async upsert(row){writes.push(clone(row));server.set(row.user_id,{snapshot:clone(row.snapshot),updated_at:row.updated_at});return{error:null}}}}};
+ context.supabase={auth:{async signOut(){return{error:null}}},from(){
+ const table={select(){return{eq(column,id){return{async maybeSingle(){if(readOverride)return readOverride(id);return{data:clone(server.get(id)||null),error:null}}}}}},async upsert(row){writes.push(clone(row));server.set(row.user_id,{snapshot:clone(row.snapshot),updated_at:row.updated_at});return{error:null}},
+ update(row){const filters={};return{eq(k,v){filters[k]=v;return this},async select(){const prior=server.get(filters.user_id);if(!prior||prior.updated_at!==filters.updated_at)return{data:[],error:null};writes.push(clone({...row,user_id:filters.user_id}));server.set(filters.user_id,clone(row));return{data:[clone(row)],error:null}}}},
+ insert(row){return{async select(){if(server.has(row.user_id))return{data:null,error:{code:'23505',message:'duplicate'}};writes.push(clone(row));server.set(row.user_id,{snapshot:clone(row.snapshot),updated_at:row.updated_at});return{data:[clone(row)],error:null}}}}};return table;}};
  vm.createContext(context);vm.runInContext(core+';window.qa={hydrate,startPolling,resetAccount,getEpoch:()=>accountEpoch};',context);
  return{ctx:context,storage,writes,polls,timers,api:context.window.CABINET_SYNC,hydrate:id=>context.window.qa.hydrate(id?{id}:null),override(fn){readOverride=fn},async flush(){for(const [id,fn]of [...timers]){timers.delete(id);await fn()}}};
 }
@@ -36,7 +39,7 @@ function browser(server,storage=new Map()){
  const p=browser(server);await p.hydrate(A);p.override(()=>new Promise(resolve=>release=resolve));const polling=[...p.polls.values()][0]();p.override(null);await p.hydrate(B);release({data:{snapshot:example('late-poll-A'),updated_at:'2099'},error:null});await polling;assert.equal(p.ctx.visible.clients[0].name,'B-private');
  // An older queued write must not replace a newer unsent edit in recovery storage.
  const q=browser(server);await q.hydrate(A);let finishWrite;
- q.ctx.supabase.from=()=>({async upsert(){return new Promise(resolve=>finishWrite=()=>resolve({error:null}))}});
+ const qFrom=q.ctx.supabase.from;q.ctx.supabase.from=()=>{const table=qFrom();const update=table.update;table.update=row=>{const mutation=update(row),select=mutation.select;mutation.select=()=>new Promise(resolve=>finishWrite=async()=>resolve(await select()));return mutation};return table};
  const older=example('older'),newer=example('newer');
  q.api.markPending(JSON.stringify(older));q.api.save(older);const sending=q.flush();await Promise.resolve();await Promise.resolve();
  q.api.markPending(JSON.stringify(newer));finishWrite();await sending;
