@@ -24,15 +24,23 @@ async function loadCreateClient(){
   showSdkLoadError(lastError);throw lastError;
 }
 const createClient=await loadCreateClient();
+function requestTimeoutMessage(input){
+  let path='';
+  try{path=new URL(typeof input==='string'||input instanceof URL?input:input.url,cfg.url).pathname;}catch{}
+  if(/\/auth\/v1\/(recover|otp|resend)$/.test(path))return 'Нет ответа сервера за 15 секунд. Статус отправки письма неизвестен. Проверь почту; не отправляй запрос повторно сразу.';
+  if(path.endsWith('/auth/v1/token'))return 'Сервер входа не ответил за 15 секунд. Вход не подтверждён. Попробуй войти позже.';
+  return 'Нет ответа сервера за 15 секунд. Результат запроса не подтверждён. Попробуй позже.';
+}
 async function authFetch(input, options = {}) {
   const controller = new AbortController();
+  let timedOut=false;
   const forwardAbort = () => controller.abort();
   if (options.signal?.aborted) controller.abort();
   options.signal?.addEventListener('abort', forwardAbort, {once:true});
-  const timeout = setTimeout(() => controller.abort(), 15000);
+  const timeout = setTimeout(() => {timedOut=true;controller.abort();}, 15000);
   try { return await fetch(input, {...options, signal:controller.signal}); }
   catch (error) {
-    if (controller.signal.aborted) throw new Error('Нет ответа сервера за 15 секунд. Статус отправки письма неизвестен. Проверь почту; не отправляй запрос повторно сразу.');
+    if (timedOut) throw new Error(requestTimeoutMessage(input));
     throw error;
   } finally {
     clearTimeout(timeout);
