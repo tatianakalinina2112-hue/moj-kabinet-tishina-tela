@@ -62,6 +62,7 @@ function resetAccount(user=null){
   currentUser=user;
   document.getElementById('cloudSetup')?.remove();
   document.getElementById('passwordSetup')?.remove();
+  document.getElementById('cloudLoadGate')?.remove();
   window.__cabinetActivate?.(null,{});
 }
 function applySnapshot(id,snapshot){
@@ -115,10 +116,34 @@ const gate = () => {
     finally{busy=false;form.querySelector('button').disabled=false;setTimeout(()=>{reset.disabled=false;},60000);}
   });
 };
+function showDataLoad(user,epoch,failed=false){
+  document.getElementById('cloudGate')?.remove();
+  document.getElementById('cloudLoadGate')?.remove();
+  const wrap=document.createElement('div');wrap.id='cloudLoadGate';
+  wrap.setAttribute('role','dialog');wrap.setAttribute('aria-modal','true');wrap.setAttribute('aria-labelledby','cloudLoadTitle');
+  wrap.innerHTML='<div style="box-sizing:border-box;width:min(460px,100%);padding:24px;border-radius:22px;background:#eff8fd;color:#123653;box-shadow:0 20px 60px #0006"><h2 id="cloudLoadTitle" style="margin-top:0"></h2><p id="cloudLoadMessage" role="status" aria-live="polite" style="line-height:1.55"></p><button id="cloudLoadRetry" class="btn gold" type="button"></button></div>';
+  Object.assign(wrap.style,{position:'fixed',inset:'0',zIndex:'9999',display:'grid',placeItems:'center',padding:'20px',background:'#071d31ef',overflowY:'auto'});
+  wrap.querySelector('#cloudLoadTitle').textContent=failed?'Не удалось загрузить данные':'Загружаю данные кабинета…';
+  wrap.querySelector('#cloudLoadMessage').textContent=failed?'Вход сохранён. Когда соединение восстановится, повтори загрузку. Пароль вводить заново не нужно.':'Вход выполнен. Ожидаю данные с сервера.';
+  const button=wrap.querySelector('#cloudLoadRetry');
+  button.textContent=failed?'Повторить загрузку':'Загружаю…';button.disabled=!failed;
+  button.addEventListener('click',async()=>{
+    if(button.disabled||!isCurrent(user.id,epoch))return;
+    button.disabled=true;
+    await hydrate(user);
+  });
+  if(!document.getElementById('cloudLoadStyle')){
+    const style=document.createElement('style');style.id='cloudLoadStyle';
+    style.textContent='#cloudStatus{position:fixed;right:12px;top:12px;z-index:50;padding:7px 12px;border-radius:99px;background:#e8f4fb;color:#123653;font-size:12px;box-shadow:0 2px 10px #1234}#cloudStatus[data-error="1"]{background:#fee;color:#822}';document.head.append(style);
+  }
+  document.body.append(wrap);
+  if(failed)button.focus();
+}
 async function hydrate(user) {
-  resetAccount(user);gate();
-  if(!user){setStatus('Supabase: ожидается вход');return;}
+  resetAccount(user);
+  if(!user){gate();setStatus('Supabase: ожидается вход');return;}
   const id=user.id,epoch=accountEpoch;
+  showDataLoad(user,epoch);
   setStatus('Загружаю данные кабинета…');
   try{
     const {data:row,error}=await supabase.from('cabinet_state').select('snapshot,updated_at').eq('user_id',id).maybeSingle();
@@ -129,12 +154,13 @@ async function hydrate(user) {
     const snapshot=pending?JSON.parse(pending):row?.snapshot||(ownLocal?JSON.parse(ownLocal):{});
     applySnapshot(id,snapshot);accountReady=true;
     document.getElementById('cloudGate')?.remove();
+    document.getElementById('cloudLoadGate')?.remove();
     if(row?.snapshot||!ownLocal){
       syncEnabled=true;lastCloudUpdate=row?.updated_at||'';
       setStatus('Свои данные загружены.');startPolling();
       if(pending)window.CABINET_SYNC.save(snapshot);
     }else{setStatus('Своя локальная копия сохранена. Выбери подключение синхронизации.');initialSyncChoice(user);}
-  }catch(error){if(isCurrent(id,epoch)){resetAccount(user);gate();setStatus('Облачная загрузка не удалась: '+error.message,true);}}
+  }catch(error){if(isCurrent(id,epoch)){resetAccount(user);showDataLoad(user,accountEpoch,true);setStatus('Облачная загрузка не удалась: '+error.message,true);}}
 }
 function startPolling(){
   clearInterval(poller);const id=currentUser.id,epoch=accountEpoch;
